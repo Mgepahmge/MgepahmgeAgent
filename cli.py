@@ -111,7 +111,7 @@ def _provider_list():
     for name in registry.list():
         p = registry.get(name)
         marker = "[green]●[/]" if name == active else " "
-        key_display = (p.api_key[:8] + "…") if p.api_key else "[dim]无[/]"
+        key_display = f"env:{p.api_key_env}" if p.api_key_env else ("[dim]明文[/]" if p.api_key else "[red]未配置[/]")
         table.add_row(marker, name, p.type, p.model, p.base_url or "[dim]-[/]", key_display)
 
     console.print(table)
@@ -138,13 +138,17 @@ def _provider_add():
 
     ptype = Prompt.ask("类型", choices=["anthropic", "openai", "ollama"], default="openai")
     model = Prompt.ask("模型名称", default="")
-    api_key = Prompt.ask("API Key（本地模型可留空）", default="", password=True)
+    console.print("[dim]推荐填写环境变量名（如 PROVIDER_KEY_CLAUDE），Key 存在容器外宿主机上。[/]")
+    api_key_env = Prompt.ask("API Key 环境变量名（推荐，如 PROVIDER_KEY_CLAUDE）", default="")
+    api_key = ""
+    if not api_key_env:
+        api_key = Prompt.ask("或直接填写 API Key（不推荐）", default="", password=True)
     base_url = Prompt.ask("Base URL（使用官方端点可留空）", default="")
     max_tokens = int(Prompt.ask("Max Tokens", default="8192"))
 
     from core.config import ProviderProfile
     profile = ProviderProfile(
-        name=name, type=ptype, api_key=api_key,
+        name=name, type=ptype, api_key=api_key, api_key_env=api_key_env,
         base_url=base_url, model=model, max_tokens=max_tokens,
     )
     _cfg.providers.add(profile)
@@ -172,9 +176,12 @@ def _provider_edit(name: str):
         return
     console.print(f"[bold]编辑 {name}[/]（直接回车保留当前值）\n")
     p.model     = Prompt.ask("模型名称",    default=p.model)
-    new_key     = Prompt.ask("API Key",     default="", password=True)
-    if new_key:
-        p.api_key = new_key
+    new_env = Prompt.ask("API Key 环境变量名", default=p.api_key_env)
+    p.api_key_env = new_env
+    if not new_env:
+        new_key = Prompt.ask("或直接填 API Key（不推荐）", default="", password=True)
+        if new_key:
+            p.api_key = new_key
     p.base_url  = Prompt.ask("Base URL",   default=p.base_url)
     p.max_tokens = int(Prompt.ask("Max Tokens", default=str(p.max_tokens)))
     _cfg.providers.add(p)

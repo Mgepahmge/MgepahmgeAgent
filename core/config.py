@@ -1,5 +1,6 @@
 """
 config.py - 统一配置加载，支持多 LLM Provider
+API Key 通过环境变量引用，不存明文
 """
 import os
 import json
@@ -25,19 +26,36 @@ def _expand(val: str) -> str:
 
 @dataclass
 class ProviderProfile:
-    """一个 LLM provider 配置"""
-    name: str                   # 唯一标识，例如 "claude" / "openai" / "deepseek"
-    type: str                   # 驱动类型: anthropic | openai | ollama
-    api_key: str = ""
-    base_url: str = ""          # 自定义 base_url（OpenAI 兼容接口必填）
+    """
+    一个 LLM provider 配置。
+    api_key      : 直接存明文（仅用于手动编辑/测试，不推荐）
+    api_key_env  : 推荐方式，填环境变量名，运行时动态读取
+                   例如 "PROVIDER_KEY_CLAUDE"
+    resolved_api_key 属性统一读取最终 key。
+    """
+    name: str
+    type: str                   # anthropic | openai | ollama
+    api_key: str = ""           # 明文（不推荐）
+    api_key_env: str = ""       # 环境变量名（推荐）
+    base_url: str = ""
     model: str = ""
     max_tokens: int = 8192
+
+    @property
+    def resolved_api_key(self) -> str:
+        """优先从环境变量读取，其次用字段明文值"""
+        if self.api_key_env:
+            val = os.getenv(self.api_key_env, "")
+            if val:
+                return val
+        return self.api_key
 
     def to_dict(self) -> dict:
         return {
             "name": self.name,
             "type": self.type,
-            "api_key": self.api_key,
+            "api_key": "",              # 序列化时永远不写明文 key
+            "api_key_env": self.api_key_env,
             "base_url": self.base_url,
             "model": self.model,
             "max_tokens": self.max_tokens,
@@ -52,15 +70,7 @@ class ProviderProfile:
 class ProviderRegistry:
     """
     管理所有 LLM Provider，持久化到 config/providers.json。
-
-    接口：
-      registry.list()            → 所有 provider 名称
-      registry.get(name)         → ProviderProfile | None
-      registry.add(profile)      → 添加/更新并保存
-      registry.remove(name)      → 删除
-      registry.set_active(name)  → 切换当前 provider
-      registry.active()          → 当前 ProviderProfile | None
-      registry.active_name()     → 当前名称字符串
+    文件中只存 api_key_env（变量名），不存明文 Key。
     """
 
     def __init__(self):
@@ -91,25 +101,24 @@ class ProviderRegistry:
         PROVIDERS_FILE.write_text(json.dumps(data, indent=2, ensure_ascii=False))
 
     def _seed_defaults(self):
-        """首次运行写入默认示例"""
         defaults = [
             ProviderProfile(
                 name="claude",
                 type="anthropic",
-                api_key=os.getenv("ANTHROPIC_API_KEY", ""),
+                api_key_env="PROVIDER_KEY_CLAUDE",
                 model="claude-sonnet-4-20250514",
             ),
             ProviderProfile(
                 name="openai",
                 type="openai",
-                api_key=os.getenv("OPENAI_API_KEY", ""),
+                api_key_env="PROVIDER_KEY_OPENAI",
                 base_url="https://api.openai.com/v1",
                 model="gpt-4o",
             ),
             ProviderProfile(
                 name="deepseek",
-                type="openai",          # DeepSeek 兼容 OpenAI SDK
-                api_key=os.getenv("DEEPSEEK_API_KEY", ""),
+                type="openai",
+                api_key_env="PROVIDER_KEY_DEEPSEEK",
                 base_url="https://api.deepseek.com/v1",
                 model="deepseek-chat",
             ),
@@ -124,11 +133,11 @@ class ProviderRegistry:
             self._profiles[p.name] = p
         # 自动激活第一个有 key 的
         for p in defaults:
-            if p.api_key or p.type == "ollama":
+            if p.resolved_api_key or p.type == "ollama":
                 self._active = p.name
                 break
-
-    # ── 公开接口 ──────────────────────────────────────
+        if not self._active and defaults:
+            self._active = defaults[0].name
 
     def list(self) -> list[str]:
         return list(self._profiles.keys())
@@ -205,7 +214,7 @@ class MCPConfig:
 
 @dataclass
 class AgentConfig:
-    workspace_dir: str = field(default_factory=lambda: _expand(os.getenv("WORKSPACE_DIR", "~/workspace")))
+    workspace_dir: str = field(default_factory=lambda: _expand(os.getenv("WORKSPACE_DIR", "/workspace")))
     log_level: str = field(default_factory=lambda: os.getenv("LOG_LEVEL", "INFO"))
     log_file: str = field(default_factory=lambda: os.getenv("LOG_FILE", "./logs/agent.log"))
     rag: RAGConfig = field(default_factory=RAGConfig)

@@ -4,7 +4,7 @@ agent_graph.py - LangGraph Agent 核心
 """
 from __future__ import annotations
 import logging
-from typing import Annotated, Optional
+from typing import Annotated
 import operator
 
 from langchain_core.messages import BaseMessage, SystemMessage, HumanMessage, AIMessage
@@ -15,62 +15,59 @@ from typing_extensions import TypedDict
 
 logger = logging.getLogger(__name__)
 
-SYSTEM_PROMPT = """你是一个运行在 Ubuntu 系统上的全能 AI 助手，拥有以下能力：
+SYSTEM_PROMPT = """你是一个运行在 Ubuntu 系统上的全能 AI 助手，拥有操作系统级别的完整能力：
 
-【文件系统】读写 workspace 内的文件，列目录，查找文件
+【文件系统】可以读写系统内任意有权限的文件和目录
 【Web】搜索互联网，抓取网页内容
-【Shell】在 workspace 中执行白名单命令（git, python, grep, nvidia-smi 等）
-【MCP 工具】通过 MCP 协议连接的外部服务（按实际加载的工具为准）
+【Shell】执行 shell 命令，安装软件，运行脚本，管理进程
+【MCP 工具】通过 MCP 协议连接的外部服务
 【知识库】如果启用了 RAG，可从私有知识库中检索相关内容
 
 工作原则：
-- 收到任务后，先思考最优路径，再一步步执行
+- 收到任务后先思考最优路径，再逐步执行
 - 需要信息时主动使用工具获取，不要凭空猜测
-- 执行有破坏性操作（删除、覆盖）前，先说明再执行
-- 代码和命令执行后，检查输出是否符合预期
+- 【重要】执行以下破坏性操作前，必须先用文字清晰说明：
+    * 删除文件或目录（rm）
+    * 覆盖已有文件内容
+    * 修改系统配置文件
+    * 卸载软件包
+    * 任何不可逆的操作
+  说明后等待用户明确确认（回复"确认"或"yes"等），再执行。
+  若用户未确认，不得执行。
+- 代码和命令执行后检查输出是否符合预期
 - 完成后给出清晰的结果摘要
 
-当前工作目录：{workspace}
+workspace 目录（{workspace}）是与宿主机交换文件的接口：
+- 宿主机放入 workspace 的文件，Agent 可以读取处理
+- Agent 输出的结果文件，放入 workspace 供宿主机取用
 """
 
 
 # ──────────────────────────────────────────
-# LLM 工厂：根据 ProviderProfile 创建对应 LangChain LLM
+# LLM 工厂
 # ──────────────────────────────────────────
 
 def build_llm(profile):
-    """
-    根据 ProviderProfile.type 创建对应的 LangChain chat model。
-
-    type = "anthropic" → ChatAnthropic
-    type = "openai"    → ChatOpenAI（也支持任意 OpenAI 兼容接口，如 DeepSeek、Qwen、本地 vLLM）
-    type = "ollama"    → ChatOllama
-    """
     ptype = profile.type.lower()
+    key = profile.resolved_api_key
 
     if ptype == "anthropic":
         from langchain_anthropic import ChatAnthropic
-        kwargs = dict(
-            model=profile.model,
-            api_key=profile.api_key,
-            max_tokens=profile.max_tokens,
-        )
+        kwargs = dict(model=profile.model, api_key=key, max_tokens=profile.max_tokens)
         if profile.base_url:
             kwargs["base_url"] = profile.base_url
         llm = ChatAnthropic(**kwargs)
-        logger.info(f"Provider: Anthropic | 模型: {profile.model}")
 
     elif ptype == "openai":
         from langchain_openai import ChatOpenAI
         kwargs = dict(
             model=profile.model,
-            api_key=profile.api_key or "placeholder",  # 部分兼容接口不需要 key
+            api_key=key or "placeholder",
             max_tokens=profile.max_tokens,
         )
         if profile.base_url:
             kwargs["base_url"] = profile.base_url
         llm = ChatOpenAI(**kwargs)
-        logger.info(f"Provider: OpenAI 兼容 ({profile.base_url or 'openai'}) | 模型: {profile.model}")
 
     elif ptype == "ollama":
         from langchain_ollama import ChatOllama
@@ -78,13 +75,11 @@ def build_llm(profile):
         if profile.base_url:
             kwargs["base_url"] = profile.base_url
         llm = ChatOllama(**kwargs)
-        logger.info(f"Provider: Ollama ({profile.base_url}) | 模型: {profile.model}")
 
     else:
-        raise ValueError(
-            f"未知 provider type: '{ptype}'，支持: anthropic / openai / ollama"
-        )
+        raise ValueError(f"未知 provider type: '{ptype}'，支持: anthropic / openai / ollama")
 
+    logger.info(f"Provider: {profile.name} ({profile.type}) | 模型: {profile.model}")
     return llm
 
 
@@ -149,15 +144,10 @@ def should_continue(state: AgentState) -> str:
 # ──────────────────────────────────────────
 
 def build_agent(cfg, kb, all_tools: list):
-    """
-    cfg: AgentConfig
-    kb:  KnowledgeBase | None
-    all_tools: 内置工具 + MCP 工具
-    """
     profile = cfg.providers.active()
     if profile is None:
         raise RuntimeError(
-            "没有激活的 LLM Provider，请用 /provider add 添加一个，或编辑 config/providers.json"
+            "没有激活的 LLM Provider，请用 /provider add 添加，或编辑 config/providers.json"
         )
 
     llm = build_llm(profile)
