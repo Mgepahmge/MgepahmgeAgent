@@ -120,12 +120,30 @@ def _run_query(query: str, thread_id: str) -> str:
     # 保存 AI 回复
     save_message(thread_id, "assistant", answer)
 
-    # 异步提取记忆（不阻塞主流程）
-    from core.database import count_messages
+    from core.database import count_messages, load_messages, update_session_summary
+    msg_count = count_messages(thread_id)
+
+    # 第2条消息后（user+assistant各1条）异步生成对话标题
+    if msg_count == 2:
+        async def _gen_title():
+            from core.memory import generate_session_title
+            msgs = load_messages(thread_id)
+            title = await generate_session_title(msgs, _llm)
+            if title:
+                from core.database import get_conn
+                with get_conn() as conn:
+                    conn.execute("UPDATE sessions SET name=? WHERE id=?", (title, thread_id))
+        try:
+            loop = asyncio.new_event_loop()
+            loop.run_until_complete(_gen_title())
+            loop.close()
+        except Exception:
+            pass
+
+    # 每 N 条消息自动提取长期记忆
     from core.memory import MEMORY_EXTRACT_THRESHOLD, extract_memories
-    if count_messages(thread_id) % MEMORY_EXTRACT_THRESHOLD == 0:
+    if msg_count % MEMORY_EXTRACT_THRESHOLD == 0:
         async def _extract():
-            from core.database import load_messages
             msgs = load_messages(thread_id)
             await extract_memories(msgs, _llm)
         try:
@@ -142,22 +160,24 @@ def _run_query(query: str, thread_id: str) -> str:
 # /session 指令
 # ──────────────────────────────────────────
 
-def _session_list():
+def _session_list() -> list:
+    """列出对话，返回 sessions 列表供索引使用"""
     from core.database import list_sessions
     sessions = list_sessions()
     if not sessions:
         console.print("[dim]暂无对话记录[/]")
-        return
+        return []
     import time
     table = Table(title="对话记录", border_style="cyan")
-    table.add_column("ID", style="dim", width=8)
+    table.add_column("#", style="bold cyan", width=4)
     table.add_column("名称")
     table.add_column("最后活跃")
     table.add_column("摘要", max_width=40)
-    for s in sessions:
+    for i, s in enumerate(sessions, 1):
         ts = time.strftime("%m-%d %H:%M", time.localtime(s["updated_at"]))
-        table.add_row(s["id"][:8], s["name"], ts, s["summary"] or "[dim]-[/]")
+        table.add_row(str(i), s["name"], ts, s["summary"] or "[dim]-[/]")
     console.print(table)
+    return sessions
 
 
 def _session_new(name: str = "") -> str:
@@ -167,14 +187,26 @@ def _session_new(name: str = "") -> str:
     return sid
 
 
-def _session_load(sid_prefix: str) -> str | None:
+def _session_load(identifier: str) -> str | None:
+    """支持序号（数字）或 ID 前缀两种方式"""
     from core.database import list_sessions
     sessions = list_sessions(100)
+    # 尝试作为序号解析
+    if identifier.isdigit():
+        idx = int(identifier) - 1
+        if 0 <= idx < len(sessions):
+            s = sessions[idx]
+            console.print(f"[green]✓ 已加载对话 #{idx+1}: {s['name']}[/]")
+            return s["id"]
+        else:
+            console.print(f"[red]序号 {identifier} 超出范围（共 {len(sessions)} 个对话）[/]")
+            return None
+    # 作为 ID 前缀
     for s in sessions:
-        if s["id"].startswith(sid_prefix):
+        if s["id"].startswith(identifier):
             console.print(f"[green]✓ 已加载对话: {s['name']}[/]")
             return s["id"]
-    console.print(f"[red]找不到 ID 以 '{sid_prefix}' 开头的对话[/]")
+    console.print(f"[red]找不到 ID 以 '{identifier}' 开头的对话[/]")
     return None
 
 
@@ -193,7 +225,7 @@ def _session_delete(sid_prefix: str):
 def _handle_session_cmd(parts: list[str], current_sid: str) -> str:
     sub = parts[1] if len(parts) > 1 else "list"
     if sub in ("list", "ls"):
-        _session_list()
+        _session_list()  # 仅展示，不切换
         return current_sid
     elif sub == "new":
         name = " ".join(parts[2:]) if len(parts) > 2 else ""
