@@ -10,9 +10,13 @@ from pathlib import Path
 from rich.console import Console
 from rich.markdown import Markdown
 from rich.panel import Panel
-from rich.prompt import Prompt, Confirm
+from rich.prompt import Confirm
 from rich.table import Table
 from rich import print as rprint
+from prompt_toolkit import prompt as pt_prompt
+from prompt_toolkit.styles import Style
+
+_PT_STYLE = Style.from_dict({"": "ansicyan bold"})
 
 console = Console()
 
@@ -84,13 +88,18 @@ def _rebuild_agent():
 
 
 def _run_query(query: str, thread_id: str) -> str:
+    import asyncio
     from langchain_core.messages import HumanMessage
-    result = _agent.invoke(
-        {"messages": [HumanMessage(content=query)], "workspace": _cfg.workspace_dir},
-        config={"configurable": {"thread_id": thread_id}},
-    )
-    last = result["messages"][-1]
-    return last.content if hasattr(last, "content") else str(last)
+
+    async def _ainvoke():
+        result = await _agent.ainvoke(
+            {"messages": [HumanMessage(content=query)], "workspace": _cfg.workspace_dir},
+            config={"configurable": {"thread_id": thread_id}},
+        )
+        last = result["messages"][-1]
+        return last.content if hasattr(last, "content") else str(last)
+
+    return asyncio.run(_ainvoke())
 
 
 # ──────────────────────────────────────────
@@ -291,10 +300,14 @@ def chat():
 
     while True:
         try:
-            user_input = Prompt.ask("\n[bold blue]你[/]").strip()
+            # 使用 prompt_toolkit 处理输入，完整支持中文输入和编辑
+            user_input = pt_prompt("\n你> ").strip()
         except (KeyboardInterrupt, EOFError):
             console.print("\n[dim]再见！[/]")
             break
+        except UnicodeDecodeError:
+            console.print("[yellow]输入编码错误，请重试[/]")
+            continue
 
         if not user_input:
             continue

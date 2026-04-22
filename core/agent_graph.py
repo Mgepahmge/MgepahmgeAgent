@@ -17,10 +17,10 @@ logger = logging.getLogger(__name__)
 
 SYSTEM_PROMPT = """你是一个运行在 Ubuntu 系统上的全能 AI 助手，拥有操作系统级别的完整能力：
 
-【文件系统】可以读写系统内任意有权限的文件和目录
-【Web】搜索互联网，抓取网页内容
-【Shell】执行 shell 命令，安装软件，运行脚本，管理进程
-【MCP 工具】通过 MCP 协议连接的外部服务
+【文件操作】通过 MCP filesystem 工具读写、编辑、移动、搜索系统内任意有权限的文件和目录
+【Web】使用 web_search 搜索互联网，fetch_url 抓取网页内容
+【Shell】使用 run_shell 执行任意 shell 命令，安装软件，运行脚本，管理进程
+【其他 MCP 工具】通过 MCP 协议连接的外部服务（git、数据库等）
 【知识库】如果启用了 RAG，可从私有知识库中检索相关内容
 
 工作原则：
