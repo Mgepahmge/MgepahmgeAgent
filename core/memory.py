@@ -1,20 +1,25 @@
 """
-memory.py - 长期记忆管理
-- 自动从对话提取记忆
-- 提供给 Agent 的记忆工具（save/delete/list）
-- 构建注入 system prompt 的记忆片段
+memory.py - 长期记忆核心逻辑
+负责：记忆注入 system prompt、自动提取（可开关）、对话标题生成
+注意：Agent 可调用的记忆工具在 tools/memory_tools.py（插件）
 """
 from __future__ import annotations
 import json
 import logging
-from .database import load_all_memories, save_memory, delete_memory
+import os
+from .database import load_all_memories, save_memory
 
 logger = logging.getLogger(__name__)
 
+# 每隔多少条消息触发一次自动提取
 MEMORY_EXTRACT_THRESHOLD = 10
+
+# 自动提取开关，默认关闭，在 .env 中设置 AUTO_EXTRACT_MEMORY=true 开启
+AUTO_EXTRACT_MEMORY = os.getenv("AUTO_EXTRACT_MEMORY", "false").lower() == "true"
 
 
 def build_memory_prompt() -> str:
+    """构建注入 system prompt 的记忆片段"""
     memories = load_all_memories()
     if not memories:
         return ""
@@ -23,9 +28,15 @@ def build_memory_prompt() -> str:
 
 
 async def extract_memories(messages: list, llm) -> int:
-    """从对话中自动提取长期记忆"""
+    """
+    从对话中自动提取长期记忆。
+    仅在 AUTO_EXTRACT_MEMORY=true 时执行，默认关闭。
+    """
+    if not AUTO_EXTRACT_MEMORY:
+        return 0
     if not messages:
         return 0
+
     conversation = "\n".join(
         f"{m['role']}: {m['content'][:500]}"
         for m in messages[-20:]
@@ -60,13 +71,9 @@ async def extract_memories(messages: list, llm) -> int:
 
 
 async def generate_session_title(messages: list, llm) -> str:
-    """
-    根据对话内容生成简短标题（8字以内）。
-    在后台异步调用，不影响主流程。
-    """
+    """根据对话内容生成简短标题（不超过10字）"""
     if not messages:
         return ""
-    # 只取前几条消息就够了
     snippet = "\n".join(
         f"{m['role']}: {m['content'][:200]}"
         for m in messages[:6]
@@ -83,52 +90,3 @@ async def generate_session_title(messages: list, llm) -> str:
     except Exception as e:
         logger.debug(f"标题生成失败: {e}")
         return ""
-
-
-# ──────────────────────────────────────────
-# Agent 可调用的记忆工具
-# ──────────────────────────────────────────
-
-from langchain_core.tools import tool
-
-
-@tool
-def memory_save(key: str, value: str) -> str:
-    """
-    保存一条长期记忆。key 是记忆的唯一标识（简短英文或中文），value 是具体内容。
-    例如：memory_save(key="用户编程语言偏好", value="偏好使用Python，不喜欢Java")
-    同一个 key 再次保存会覆盖旧值。
-    """
-    try:
-        save_memory(key, value, source="agent")
-        return f"已保存记忆：{key} = {value}"
-    except Exception as e:
-        return f"ERROR: {e}"
-
-
-@tool
-def memory_delete(key: str) -> str:
-    """
-    删除一条长期记忆。
-    例如：memory_delete(key="用户编程语言偏好")
-    """
-    try:
-        delete_memory(key)
-        return f"已删除记忆：{key}"
-    except Exception as e:
-        return f"ERROR: {e}"
-
-
-@tool
-def memory_list() -> str:
-    """
-    列出所有长期记忆。当需要了解已记住的信息时调用。
-    """
-    memories = load_all_memories()
-    if not memories:
-        return "当前没有任何长期记忆。"
-    lines = [f"- {m['key']}: {m['value']} (来源: {m['source'] or '未知'})" for m in memories]
-    return "当前长期记忆：\n" + "\n".join(lines)
-
-
-MEMORY_TOOLS = [memory_save, memory_delete, memory_list]

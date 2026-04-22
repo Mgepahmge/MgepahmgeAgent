@@ -166,11 +166,6 @@ def build_agent(cfg, kb, all_tools: list):
         )
 
     llm = build_llm(profile)
-
-    # 注入记忆工具（Agent 可主动调用来管理长期记忆）
-    from core.memory import MEMORY_TOOLS
-    all_tools = list(all_tools) + MEMORY_TOOLS
-
     llm_with_tools = llm.bind_tools(all_tools)
 
     retrieve_node = make_retrieve_node(kb)
