@@ -1,10 +1,12 @@
 """
-cli.py - 命令行入口，支持多 Provider 管理
+cli.py - 命令行入口
+支持：多 Provider、持久化对话、长期记忆、后台任务、工具插件
 """
 from __future__ import annotations
 import sys
 import uuid
 import logging
+import asyncio
 import click
 from pathlib import Path
 from rich.console import Console
@@ -12,22 +14,20 @@ from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.prompt import Confirm
 from rich.table import Table
-from rich import print as rprint
 from prompt_toolkit import prompt as pt_prompt
-from prompt_toolkit.styles import Style
-
-_PT_STYLE = Style.from_dict({"": "ansicyan bold"})
 
 console = Console()
 
 _agent = None
+_llm = None
 _kb = None
 _cfg = None
 _all_tools = []
+_current_session_id = None
 
 
 def _bootstrap():
-    global _agent, _kb, _cfg, _all_tools
+    global _agent, _llm, _kb, _cfg, _all_tools
 
     sys.path.insert(0, str(Path(__file__).parent))
     from core.config import config
@@ -47,24 +47,38 @@ def _bootstrap():
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
     with console.status("[bold cyan]初始化组件...", spinner="dots"):
+        # 初始化数据库
+        from core.database import init_db
+        init_db()
+
+        # RAG
         kb = None
         if config.rag.enabled:
             from rag.knowledge_base import KnowledgeBase
             kb = KnowledgeBase.connect(config.rag)
         _kb = kb
 
+        # 内置工具
         from tools.builtin_tools import BUILTIN_TOOLS, set_workspace
         set_workspace(config.workspace_dir)
         all_tools = list(BUILTIN_TOOLS)
 
+        # 插件工具（自动发现）
+        from tools.plugin_loader import discover_plugins
+        plugin_tools = discover_plugins()
+        all_tools.extend(plugin_tools)
+
+        # MCP 工具
         if config.mcp.servers:
             from tools.mcp_loader import load_mcp_tools_sync
             all_tools.extend(load_mcp_tools_sync(config.mcp))
 
         _all_tools = all_tools
 
+        # 构建 Agent
         from core.agent_graph import build_agent
-        _agent = build_agent(config, kb, all_tools)
+        result = build_agent(config, kb, all_tools)
+        _agent, _llm = result
 
     profile = config.providers.active()
     console.print(Panel(
@@ -81,15 +95,17 @@ def _bootstrap():
 
 
 def _rebuild_agent():
-    """切换 provider 后重新构建 agent（不重新加载工具）"""
-    global _agent
+    global _agent, _llm
     from core.agent_graph import build_agent
-    _agent = build_agent(_cfg, _kb, _all_tools)
+    _agent, _llm = build_agent(_cfg, _kb, _all_tools)
 
 
 def _run_query(query: str, thread_id: str) -> str:
-    import asyncio
     from langchain_core.messages import HumanMessage
+    from core.database import save_message
+
+    # 保存用户消息
+    save_message(thread_id, "human", query)
 
     async def _ainvoke():
         result = await _agent.ainvoke(
@@ -99,11 +115,218 @@ def _run_query(query: str, thread_id: str) -> str:
         last = result["messages"][-1]
         return last.content if hasattr(last, "content") else str(last)
 
-    return asyncio.run(_ainvoke())
+    answer = asyncio.run(_ainvoke())
+
+    # 保存 AI 回复
+    save_message(thread_id, "assistant", answer)
+
+    # 异步提取记忆（不阻塞主流程）
+    from core.database import count_messages
+    from core.memory import MEMORY_EXTRACT_THRESHOLD, extract_memories
+    if count_messages(thread_id) % MEMORY_EXTRACT_THRESHOLD == 0:
+        async def _extract():
+            from core.database import load_messages
+            msgs = load_messages(thread_id)
+            await extract_memories(msgs, _llm)
+        try:
+            loop = asyncio.new_event_loop()
+            loop.run_until_complete(_extract())
+            loop.close()
+        except Exception:
+            pass
+
+    return answer
 
 
 # ──────────────────────────────────────────
-# /provider 指令处理
+# /session 指令
+# ──────────────────────────────────────────
+
+def _session_list():
+    from core.database import list_sessions
+    sessions = list_sessions()
+    if not sessions:
+        console.print("[dim]暂无对话记录[/]")
+        return
+    import time
+    table = Table(title="对话记录", border_style="cyan")
+    table.add_column("ID", style="dim", width=8)
+    table.add_column("名称")
+    table.add_column("最后活跃")
+    table.add_column("摘要", max_width=40)
+    for s in sessions:
+        ts = time.strftime("%m-%d %H:%M", time.localtime(s["updated_at"]))
+        table.add_row(s["id"][:8], s["name"], ts, s["summary"] or "[dim]-[/]")
+    console.print(table)
+
+
+def _session_new(name: str = "") -> str:
+    from core.database import create_session
+    sid = create_session(name)
+    console.print(f"[green]✓ 新建对话 {sid[:8]}[/]")
+    return sid
+
+
+def _session_load(sid_prefix: str) -> str | None:
+    from core.database import list_sessions
+    sessions = list_sessions(100)
+    for s in sessions:
+        if s["id"].startswith(sid_prefix):
+            console.print(f"[green]✓ 已加载对话: {s['name']}[/]")
+            return s["id"]
+    console.print(f"[red]找不到 ID 以 '{sid_prefix}' 开头的对话[/]")
+    return None
+
+
+def _session_delete(sid_prefix: str):
+    from core.database import list_sessions, delete_session
+    sessions = list_sessions(100)
+    for s in sessions:
+        if s["id"].startswith(sid_prefix):
+            if Confirm.ask(f"确认删除对话 '{s['name']}'？", default=False):
+                delete_session(s["id"])
+                console.print(f"[green]✓ 已删除[/]")
+            return
+    console.print(f"[red]找不到对话[/]")
+
+
+def _handle_session_cmd(parts: list[str], current_sid: str) -> str:
+    sub = parts[1] if len(parts) > 1 else "list"
+    if sub in ("list", "ls"):
+        _session_list()
+        return current_sid
+    elif sub == "new":
+        name = " ".join(parts[2:]) if len(parts) > 2 else ""
+        return _session_new(name)
+    elif sub in ("load", "switch") and len(parts) > 2:
+        new_sid = _session_load(parts[2])
+        return new_sid or current_sid
+    elif sub in ("delete", "rm") and len(parts) > 2:
+        _session_delete(parts[2])
+        return current_sid
+    else:
+        console.print(Panel(
+            "/session list              列出所有对话\n"
+            "/session new [名称]        新建对话\n"
+            "/session load <ID前缀>     加载已有对话\n"
+            "/session delete <ID前缀>   删除对话",
+            title="session 指令",
+        ))
+        return current_sid
+
+
+# ──────────────────────────────────────────
+# /memory 指令
+# ──────────────────────────────────────────
+
+def _memory_list():
+    from core.database import load_all_memories
+    memories = load_all_memories()
+    if not memories:
+        console.print("[dim]暂无长期记忆[/]")
+        return
+    table = Table(title="长期记忆", border_style="cyan")
+    table.add_column("键", style="bold")
+    table.add_column("内容")
+    table.add_column("来源", style="dim")
+    for m in memories:
+        table.add_row(m["key"], m["value"], m["source"] or "-")
+    console.print(table)
+
+
+def _memory_set(key: str, value: str):
+    from core.database import save_memory
+    save_memory(key, value, source="manual")
+    console.print(f"[green]✓ 已保存记忆: {key}[/]")
+
+
+def _memory_delete(key: str):
+    from core.database import delete_memory
+    delete_memory(key)
+    console.print(f"[green]✓ 已删除记忆: {key}[/]")
+
+
+def _handle_memory_cmd(parts: list[str]):
+    sub = parts[1] if len(parts) > 1 else "list"
+    if sub in ("list", "ls"):
+        _memory_list()
+    elif sub == "set" and len(parts) > 3:
+        _memory_set(parts[2], " ".join(parts[3:]))
+    elif sub in ("delete", "rm") and len(parts) > 2:
+        _memory_delete(parts[2])
+    else:
+        console.print(Panel(
+            "/memory list                列出所有记忆\n"
+            "/memory set <键> <值>       手动添加记忆\n"
+            "/memory delete <键>         删除记忆",
+            title="memory 指令",
+        ))
+
+
+# ──────────────────────────────────────────
+# /task 指令
+# ──────────────────────────────────────────
+
+def _task_submit(description: str):
+    from core.task_runner import submit_task
+    tid = submit_task(description, _agent, _cfg.workspace_dir)
+    console.print(f"[green]✓ 任务已提交，ID: [bold]{tid}[/]（用 /task status {tid} 查看进度）[/]")
+
+
+def _task_list():
+    from core.task_runner import list_all_tasks
+    import time
+    tasks = list_all_tasks()
+    if not tasks:
+        console.print("[dim]暂无任务[/]")
+        return
+    table = Table(title="后台任务", border_style="cyan")
+    table.add_column("ID", style="bold", width=10)
+    table.add_column("描述", max_width=40)
+    table.add_column("状态")
+    table.add_column("创建时间")
+    STATUS_COLOR = {"pending": "yellow", "running": "cyan", "done": "green", "error": "red"}
+    for t in tasks:
+        color = STATUS_COLOR.get(t["status"], "white")
+        ts = time.strftime("%m-%d %H:%M", time.localtime(t["created_at"]))
+        table.add_row(t["id"], t["description"][:40], f"[{color}]{t['status']}[/]", ts)
+    console.print(table)
+
+
+def _task_status(tid: str):
+    from core.task_runner import get_task_status
+    t = get_task_status(tid)
+    if not t:
+        console.print(f"[red]找不到任务 {tid}[/]")
+        return
+    console.print(Panel(
+        f"描述: {t['description']}\n"
+        f"状态: {t['status']}\n"
+        f"结果: {t['result'] or '(进行中)'}\n"
+        f"错误: {t['error'] or '无'}",
+        title=f"任务 {t['id']}",
+    ))
+
+
+def _handle_task_cmd(parts: list[str]):
+    sub = parts[1] if len(parts) > 1 else "list"
+    if sub in ("list", "ls"):
+        _task_list()
+    elif sub in ("run", "submit") and len(parts) > 2:
+        _task_submit(" ".join(parts[2:]))
+    elif sub in ("status", "show") and len(parts) > 2:
+        _task_status(parts[2])
+    else:
+        console.print(Panel(
+            "/task list                      列出所有任务\n"
+            "/task run <任务描述>             提交后台任务\n"
+            "/task status <ID>               查看任务状态",
+            title="task 指令",
+        ))
+
+
+# ──────────────────────────────────────────
+# /provider 指令
 # ──────────────────────────────────────────
 
 def _provider_list():
@@ -116,13 +339,11 @@ def _provider_list():
     table.add_column("模型")
     table.add_column("Base URL")
     table.add_column("API Key")
-
     for name in registry.list():
         p = registry.get(name)
         marker = "[green]●[/]" if name == active else " "
         key_display = f"env:{p.api_key_env}" if p.api_key_env else ("[dim]明文[/]" if p.api_key else "[red]未配置[/]")
         table.add_row(marker, name, p.type, p.model, p.base_url or "[dim]-[/]", key_display)
-
     console.print(table)
     console.print(f"[dim]当前激活: [bold]{active}[/][/]")
 
@@ -133,28 +354,24 @@ def _provider_use(name: str):
         p = _cfg.providers.active()
         console.print(f"[green]✓ 已切换到 {name} ({p.type} / {p.model})[/]")
     else:
-        console.print(f"[red]Provider '{name}' 不存在，用 /provider list 查看[/]")
+        console.print(f"[red]Provider '{name}' 不存在[/]")
 
 
 def _provider_add():
-    """交互式添加 provider"""
-    console.print("[bold]添加新 Provider[/]（直接回车使用括号内默认值）\n")
-
-    name = Prompt.ask("名称（唯一标识，如 my-qwen）").strip()
+    from rich.prompt import Prompt
+    console.print("[bold]添加新 Provider[/]\n")
+    name = Prompt.ask("名称").strip()
     if not name:
-        console.print("[red]名称不能为空[/]")
         return
-
     ptype = Prompt.ask("类型", choices=["anthropic", "openai", "ollama"], default="openai")
     model = Prompt.ask("模型名称", default="")
-    console.print("[dim]推荐填写环境变量名（如 PROVIDER_KEY_CLAUDE），Key 存在容器外宿主机上。[/]")
-    api_key_env = Prompt.ask("API Key 环境变量名（推荐，如 PROVIDER_KEY_CLAUDE）", default="")
+    console.print("[dim]推荐填写环境变量名（Key 存在容器外宿主机）[/]")
+    api_key_env = Prompt.ask("API Key 环境变量名（推荐）", default="")
     api_key = ""
     if not api_key_env:
         api_key = Prompt.ask("或直接填写 API Key（不推荐）", default="", password=True)
-    base_url = Prompt.ask("Base URL（使用官方端点可留空）", default="")
+    base_url = Prompt.ask("Base URL（官方端点可留空）", default="")
     max_tokens = int(Prompt.ask("Max Tokens", default="8192"))
-
     from core.config import ProviderProfile
     profile = ProviderProfile(
         name=name, type=ptype, api_key=api_key, api_key_env=api_key_env,
@@ -162,63 +379,23 @@ def _provider_add():
     )
     _cfg.providers.add(profile)
     console.print(f"[green]✓ Provider '{name}' 已保存[/]")
-
     if Confirm.ask(f"立即切换到 {name}？", default=True):
         _provider_use(name)
 
 
-def _provider_remove(name: str):
-    if Confirm.ask(f"确认删除 provider '{name}'？", default=False):
-        if _cfg.providers.remove(name):
-            console.print(f"[green]✓ 已删除 {name}[/]")
-            # 如果删的是当前激活的，重建 agent
-            _rebuild_agent()
-        else:
-            console.print(f"[red]Provider '{name}' 不存在[/]")
-
-
-def _provider_edit(name: str):
-    """编辑已有 provider 的字段"""
-    p = _cfg.providers.get(name)
-    if p is None:
-        console.print(f"[red]Provider '{name}' 不存在[/]")
-        return
-    console.print(f"[bold]编辑 {name}[/]（直接回车保留当前值）\n")
-    p.model     = Prompt.ask("模型名称",    default=p.model)
-    new_env = Prompt.ask("API Key 环境变量名", default=p.api_key_env)
-    p.api_key_env = new_env
-    if not new_env:
-        new_key = Prompt.ask("或直接填 API Key（不推荐）", default="", password=True)
-        if new_key:
-            p.api_key = new_key
-    p.base_url  = Prompt.ask("Base URL",   default=p.base_url)
-    p.max_tokens = int(Prompt.ask("Max Tokens", default=str(p.max_tokens)))
-    _cfg.providers.add(p)
-    console.print(f"[green]✓ '{name}' 已更新[/]")
-    if _cfg.providers.active_name() == name:
-        _rebuild_agent()
-
-
 def _handle_provider_cmd(parts: list[str]):
     sub = parts[1] if len(parts) > 1 else "list"
-
     if sub in ("list", "ls"):
         _provider_list()
     elif sub in ("use", "switch") and len(parts) > 2:
         _provider_use(parts[2])
     elif sub == "add":
         _provider_add()
-    elif sub == "remove" and len(parts) > 2:
-        _provider_remove(parts[2])
-    elif sub == "edit" and len(parts) > 2:
-        _provider_edit(parts[2])
     else:
         console.print(Panel(
-            "/provider list              列出所有 provider\n"
-            "/provider use  <名称>       切换到指定 provider\n"
-            "/provider add               交互式添加新 provider\n"
-            "/provider edit <名称>       修改已有 provider\n"
-            "/provider remove <名称>     删除 provider",
+            "/provider list           列出所有 provider\n"
+            "/provider use <名称>     切换 provider\n"
+            "/provider add            添加新 provider",
             title="provider 指令",
         ))
 
@@ -227,7 +404,8 @@ def _handle_provider_cmd(parts: list[str]):
 # 斜杠指令总路由
 # ──────────────────────────────────────────
 
-def _handle_slash(cmd: str, thread_id: str, tools: list):
+def _handle_slash(cmd: str, session_id: str, tools: list) -> str:
+    """返回（可能更新的）session_id"""
     parts = cmd.strip().split()
     name = parts[0].lower()
 
@@ -237,38 +415,53 @@ def _handle_slash(cmd: str, thread_id: str, tools: list):
 
     elif name == "/help":
         console.print(Panel(
-            "/help                    显示帮助\n"
-            "/provider [子命令]       管理 LLM Provider（list/use/add/edit/remove）\n"
-            "/tools                   列出所有工具\n"
-            "/ingest <路径>           导入文档到知识库\n"
-            "/clear                   清空对话记忆\n"
-            "/quit                    退出",
+            "/help                         显示帮助\n"
+            "/provider [子命令]             管理 LLM Provider\n"
+            "/session  [子命令]             管理对话记录（list/new/load/delete）\n"
+            "/memory   [子命令]             管理长期记忆（list/set/delete）\n"
+            "/task     [子命令]             后台任务（list/run/status）\n"
+            "/tools                        列出所有工具\n"
+            "/ingest <路径>                导入文档到知识库\n"
+            "/clear                        清空当前对话记忆（新建会话）\n"
+            "/quit                         退出",
             title="指令列表",
         ))
 
     elif name == "/provider":
         _handle_provider_cmd(parts)
 
+    elif name == "/session":
+        return _handle_session_cmd(parts, session_id)
+
+    elif name == "/memory":
+        _handle_memory_cmd(parts)
+
+    elif name == "/task":
+        _handle_task_cmd(parts)
+
     elif name == "/tools":
         lines = [f"  [cyan]{t.name}[/]: {(t.description or '')[:80]}" for t in tools]
         console.print(Panel("\n".join(lines), title=f"可用工具 ({len(tools)})"))
 
     elif name == "/clear":
-        console.print("[yellow]对话记忆已清空（下一条消息开启新会话）[/]")
+        new_sid = _session_new()
+        console.print("[yellow]已开启新对话[/]")
+        return new_sid
 
     elif name == "/ingest":
         if len(parts) < 2:
-            console.print("[red]用法: /ingest <文件或目录路径>[/]")
-            return
-        if _kb is None:
-            console.print("[red]RAG 未启用（检查 .env 数据库配置）[/]")
-            return
-        with console.status(f"导入 {parts[1]}..."):
-            n = _kb.ingest(parts[1])
-        console.print(f"[green]✓ 导入完成：{n} 个文本块[/]")
+            console.print("[red]用法: /ingest <路径>[/]")
+        elif _kb is None:
+            console.print("[red]RAG 未启用[/]")
+        else:
+            with console.status(f"导入 {parts[1]}..."):
+                n = _kb.ingest(parts[1])
+            console.print(f"[green]✓ 导入完成：{n} 个文本块[/]")
 
     else:
         console.print(f"[yellow]未知指令: {name}，输入 /help 查看[/]")
+
+    return session_id
 
 
 # ──────────────────────────────────────────
@@ -283,9 +476,10 @@ def cli(ctx, query):
     if ctx.invoked_subcommand is None:
         if query:
             _bootstrap()
-            thread_id = str(uuid.uuid4())
+            from core.database import create_session
+            sid = create_session()
             with console.status("[bold cyan]思考中...", spinner="dots"):
-                answer = _run_query(query, thread_id)
+                answer = _run_query(query, sid)
             console.print(Markdown(answer))
         else:
             ctx.invoke(chat)
@@ -295,12 +489,12 @@ def cli(ctx, query):
 def chat():
     """交互式对话（默认模式）"""
     tools = _bootstrap()
-    thread_id = str(uuid.uuid4())
-    console.print("[dim]输入问题后回车。[bold]/help[/] 查看指令，[bold]/quit[/] 退出。[/]")
+    from core.database import create_session
+    session_id = create_session()
+    console.print(f"[dim]新对话 ID: [bold]{session_id[:8]}[/]。输入 /help 查看指令。[/]")
 
     while True:
         try:
-            # 使用 prompt_toolkit 处理输入，完整支持中文输入和编辑
             user_input = pt_prompt("\n你> ").strip()
         except (KeyboardInterrupt, EOFError):
             console.print("\n[dim]再见！[/]")
@@ -313,19 +507,15 @@ def chat():
             continue
 
         if user_input.startswith("/"):
-            _handle_slash(user_input, thread_id, tools)
-            continue
-
-        # /clear 后换新 thread
-        if user_input == "/clear":
-            thread_id = str(uuid.uuid4())
+            session_id = _handle_slash(user_input, session_id, tools)
             continue
 
         with console.status("[bold cyan]思考中...", spinner="dots"):
             try:
-                answer = _run_query(user_input, thread_id)
+                answer = _run_query(user_input, session_id)
             except Exception as e:
-                answer = f"[red]执行出错: {e}[/]"
+                import traceback
+                answer = f"执行出错: {e}\n{traceback.format_exc()}"
 
         console.print("\n[bold green]Agent[/]")
         console.print(Markdown(answer))
@@ -356,7 +546,7 @@ def tools():
 @click.argument("subcommand", default="list")
 @click.argument("name", required=False)
 def provider_cmd(subcommand, name):
-    """管理 LLM Provider（list/use/add/edit/remove）"""
+    """管理 LLM Provider"""
     _bootstrap()
     parts = ["/provider", subcommand] + ([name] if name else [])
     _handle_provider_cmd(parts)
