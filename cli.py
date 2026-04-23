@@ -187,6 +187,25 @@ def _session_new(name: str = "") -> str:
     return sid
 
 
+def _show_session_history(sid: str):
+    """展示一个对话的历史消息"""
+    import time
+    from core.database import load_messages, get_session
+    session = get_session(sid)
+    messages = load_messages(sid)
+    if not messages:
+        console.print("[dim]该对话暂无消息记录[/]")
+        return
+    name = session["name"] if session else sid[:8]
+    console.print(f"\n[dim]── 对话历史：{name} ──[/]")
+    for m in messages:
+        if m["role"] in ("human", "user"):
+            console.print(f"[bold blue]你[/]  {m['content'][:500]}")
+        elif m["role"] in ("assistant", "ai"):
+            console.print(f"[bold green]Agent[/]  {m['content'][:500]}")
+    console.print("[dim]── 历史结束 ──[/]\n")
+
+
 def _session_load(identifier: str) -> str | None:
     """支持序号（数字）或 ID 前缀两种方式"""
     from core.database import list_sessions

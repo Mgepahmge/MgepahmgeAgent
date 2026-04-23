@@ -2,7 +2,7 @@
 agent_graph.py - LangGraph Agent 核心
 - 支持多 Provider
 - 集成长期记忆注入
-- 使用 SqliteSaver 持久化对话
+- 使用 AsyncSqliteSaver 持久化对话（支持 ainvoke）
 """
 from __future__ import annotations
 import logging
@@ -182,13 +182,14 @@ def build_agent(cfg, kb, all_tools: list):
     graph.add_conditional_edges("llm", should_continue, {"tools": "tools", END: END})
     graph.add_edge("tools", "llm")
 
-    # SqliteSaver 持久化对话，重启后可恢复
+    # AsyncSqliteSaver 持久化对话（支持 ainvoke）
+    # 需要：pip install langgraph-checkpoint-sqlite aiosqlite
     try:
-        from langgraph.checkpoint.sqlite import SqliteSaver
-        checkpointer = SqliteSaver.from_conn_string(str(DB_PATH))
-        logger.info("使用 SQLite 持久化对话记录")
+        from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+        checkpointer = AsyncSqliteSaver.from_conn_string(str(DB_PATH))
+        logger.info("使用 AsyncSQLite 持久化对话记录")
     except Exception as e:
-        logger.warning(f"SQLite checkpointer 不可用，回退到内存: {e}")
+        logger.warning(f"AsyncSQLite checkpointer 不可用，回退到内存: {e}")
         from langgraph.checkpoint.memory import MemorySaver
         checkpointer = MemorySaver()
 
