@@ -60,27 +60,45 @@ class KnowledgeBase:
       docs = kb.search("查询语句", k=5)
     """
 
-    def __init__(self, store, embeddings):
-        self._store = store
-        self._embeddings = embeddings
+    def __init__(self, cfg):
+        self._cfg = cfg
+        self._store = None       # 懒加载，首次搜索/导入时初始化
+        self._embeddings = None  # 同上
+
+    def _ensure_store(self):
+        """懒加载：首次使用时才初始化 PGVector（含建表/扩展操作）"""
+        if self._store is not None:
+            return
+        from langchain_postgres import PGVector
+        self._embeddings = _make_embeddings(self._cfg)
+        self._store = PGVector(
+            embeddings=self._embeddings,
+            collection_name=self._cfg.table,
+            connection=self._cfg.connection_string,
+            use_jsonb=True,
+        )
+        logger.info("RAG 向量存储初始化完成")
 
     # ------------------------------------------------------------------
     # 工厂方法
     # ------------------------------------------------------------------
     @classmethod
     def connect(cls, cfg) -> Optional["KnowledgeBase"]:
-        """连接 pgvector；失败时返回 None（允许无 RAG 运行）"""
+        """
+        启动时只做轻量连接检查（ping），不初始化 PGVector。
+        PGVector 的建表/扩展操作延迟到首次实际使用时执行。
+        """
         try:
-            from langchain_postgres import PGVector
-            embeddings = _make_embeddings(cfg)
-            store = PGVector(
-                embeddings=embeddings,
-                collection_name=cfg.table,
-                connection=cfg.connection_string,
-                use_jsonb=True,
+            import psycopg2
+            # 只做一次轻量 ping，验证数据库可达
+            conn = psycopg2.connect(
+                host=cfg.host, port=cfg.port, dbname=cfg.db,
+                user=cfg.user, password=cfg.password,
+                connect_timeout=5,
             )
-            logger.info("RAG 知识库连接成功")
-            return cls(store, embeddings)
+            conn.close()
+            logger.info("RAG 知识库连接成功（向量存储将在首次使用时初始化）")
+            return cls(cfg)
         except Exception as e:
             logger.warning(f"RAG 连接失败（将以无知识库模式运行）: {e}")
             return None
@@ -133,6 +151,7 @@ class KnowledgeBase:
                 logger.warning(f"  跳过 {f.name}: {e}")
 
         if all_chunks:
+            self._ensure_store()
             self._store.add_documents(all_chunks)
             logger.info(f"导入完成：{len(all_chunks)} chunks from {len(files)} files")
         return len(all_chunks)
@@ -142,6 +161,7 @@ class KnowledgeBase:
     # ------------------------------------------------------------------
     def search(self, query: str, k: int = 5) -> list[dict]:
         """返回最相关的 k 个文档片段"""
+        self._ensure_store()
         results = self._store.similarity_search_with_relevance_scores(query, k=k)
         return [
             {
@@ -153,4 +173,5 @@ class KnowledgeBase:
         ]
 
     def as_retriever(self, k: int = 5):
+        self._ensure_store()
         return self._store.as_retriever(search_kwargs={"k": k})
