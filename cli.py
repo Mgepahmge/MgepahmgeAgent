@@ -24,6 +24,16 @@ _kb = None
 _cfg = None
 _all_tools = []
 _current_session_id = None
+_restored_sessions: set = set()  # 已从数据库恢复上下文的 session
+_event_loop = None  # 持久化事件循环，保证 InMemorySaver 状态跨调用存活
+
+
+def _get_loop():
+    global _event_loop
+    if _event_loop is None or _event_loop.is_closed():
+        import asyncio
+        _event_loop = asyncio.new_event_loop()
+    return _event_loop
 
 
 def _bootstrap():
@@ -101,13 +111,33 @@ def _rebuild_agent():
 
 
 def _run_query(query: str, thread_id: str) -> str:
-    from langchain_core.messages import HumanMessage
-    from core.database import save_message
+    from langchain_core.messages import HumanMessage, AIMessage
+    from core.database import save_message, load_messages
 
     # 保存用户消息
     save_message(thread_id, "human", query)
 
     async def _ainvoke():
+        # 如果是已加载的旧对话且尚未恢复上下文，先把历史消息注入
+        if thread_id not in _restored_sessions:
+            history = load_messages(thread_id)
+            # 取除最后一条（刚存入的当前问题）之外的所有历史
+            prior = history[:-1]
+            if prior:
+                prior_msgs = []
+                for m in prior:
+                    if m["role"] in ("human", "user"):
+                        prior_msgs.append(HumanMessage(content=m["content"]))
+                    elif m["role"] in ("assistant", "ai"):
+                        prior_msgs.append(AIMessage(content=m["content"]))
+                if prior_msgs:
+                    # 先把历史消息灌入 LangGraph，建立上下文
+                    await _agent.ainvoke(
+                        {"messages": prior_msgs, "workspace": _cfg.workspace_dir},
+                        config={"configurable": {"thread_id": thread_id}},
+                    )
+            _restored_sessions.add(thread_id)
+
         result = await _agent.ainvoke(
             {"messages": [HumanMessage(content=query)], "workspace": _cfg.workspace_dir},
             config={"configurable": {"thread_id": thread_id}},
@@ -115,7 +145,7 @@ def _run_query(query: str, thread_id: str) -> str:
         last = result["messages"][-1]
         return last.content if hasattr(last, "content") else str(last)
 
-    answer = asyncio.run(_ainvoke())
+    answer = _get_loop().run_until_complete(_ainvoke())
 
     # 保存 AI 回复
     save_message(thread_id, "assistant", answer)
