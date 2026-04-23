@@ -210,23 +210,26 @@ def _session_load(identifier: str) -> str | None:
     """支持序号（数字）或 ID 前缀两种方式"""
     from core.database import list_sessions
     sessions = list_sessions(100)
-    # 尝试作为序号解析
+    target = None
     if identifier.isdigit():
         idx = int(identifier) - 1
         if 0 <= idx < len(sessions):
-            s = sessions[idx]
-            console.print(f"[green]✓ 已加载对话 #{idx+1}: {s['name']}[/]")
-            return s["id"]
+            target = sessions[idx]
         else:
             console.print(f"[red]序号 {identifier} 超出范围（共 {len(sessions)} 个对话）[/]")
             return None
-    # 作为 ID 前缀
-    for s in sessions:
-        if s["id"].startswith(identifier):
-            console.print(f"[green]✓ 已加载对话: {s['name']}[/]")
-            return s["id"]
-    console.print(f"[red]找不到 ID 以 '{identifier}' 开头的对话[/]")
-    return None
+    else:
+        for s in sessions:
+            if s["id"].startswith(identifier):
+                target = s
+                break
+    if target is None:
+        console.print(f"[red]找不到对话[/]")
+        return None
+    console.print(f"[green]✓ 已加载对话: {target['name']}[/]")
+    if Confirm.ask("显示该对话的历史记录？", default=False):
+        _show_session_history(target["id"])
+    return target["id"]
 
 
 def _session_delete(identifier: str):
