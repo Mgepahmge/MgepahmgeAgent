@@ -15,6 +15,10 @@ from rich.panel import Panel
 from rich.prompt import Confirm
 from rich.table import Table
 from prompt_toolkit import prompt as pt_prompt
+from prompt_toolkit.history import InMemoryHistory
+from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
+from prompt_toolkit.completion import WordCompleter
+from prompt_toolkit.formatted_text import HTML
 
 console = Console()
 
@@ -587,11 +591,31 @@ def chat():
     """交互式对话（默认模式）"""
     tools = _bootstrap()
     session_id = None  # 延迟创建：首次发消息时才建 session，避免空记录
-    console.print("[dim]输入问题后回车。[bold]/help[/] 查看指令，[bold]/quit[/] 退出。[/]")
+    console.print("[dim]输入问题后回车。↑↓ 翻历史，Tab 补全指令，[bold]/help[/] 查看指令。[/]")
+
+    # 输入历史（↑↓ 翻历史）
+    _history = InMemoryHistory()
+
+    # 斜杠指令补全
+    _slash_commands = [
+        "/help", "/quit", "/exit",
+        "/session", "/session list", "/session new", "/session load", "/session delete",
+        "/memory", "/memory list", "/memory set", "/memory delete",
+        "/task", "/task list", "/task run", "/task status",
+        "/provider", "/provider list", "/provider use", "/provider add",
+        "/tools", "/ingest", "/clear",
+    ]
+    _completer = WordCompleter(_slash_commands, match_middle=False, sentence=True)
 
     while True:
         try:
-            user_input = pt_prompt("\n你> ").strip()
+            user_input = pt_prompt(
+                "\n你> ",
+                history=_history,
+                auto_suggest=AutoSuggestFromHistory(),
+                completer=_completer,
+                complete_while_typing=False,  # 只在按 Tab 时补全，不自动弹出
+            ).strip()
         except (KeyboardInterrupt, EOFError):
             console.print("\n[dim]再见！[/]")
             break
