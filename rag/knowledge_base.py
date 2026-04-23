@@ -14,6 +14,7 @@ logger = logging.getLogger(__name__)
 
 def _make_embeddings(cfg):
     """构造本地 Embedding 模型（CUDA 加速）"""
+    import os
     import torch
 
     device = cfg.embedding_device
@@ -21,9 +22,23 @@ def _make_embeddings(cfg):
         logger.warning("CUDA 不可用，回退到 CPU")
         device = "cpu"
 
-    logger.info(f"加载 Embedding 模型 {cfg.embedding_model} @ {device}")
+    # 固定缓存路径：优先用 EMBEDDING_CACHE_DIR，否则放到项目 data/models/
+    cache_dir = os.getenv("EMBEDDING_CACHE_DIR", "")
+    if not cache_dir:
+        cache_dir = str(Path(__file__).parent.parent / "data" / "models")
+    Path(cache_dir).mkdir(parents=True, exist_ok=True)
 
-    # 优先用新包 langchain-huggingface，回退到旧包
+    # 模型已下载时强制离线，跳过网络检查，加速启动
+    model_path = Path(cache_dir) / f"models--{cfg.embedding_model.replace('/', '--')}"
+    if model_path.exists():
+        os.environ["HF_HUB_OFFLINE"] = "1"
+        logger.info(f"Embedding 模型已缓存，使用离线模式")
+    else:
+        os.environ.pop("HF_HUB_OFFLINE", None)
+        logger.info(f"首次下载 Embedding 模型 {cfg.embedding_model}")
+
+    logger.info(f"加载 Embedding 模型 {cfg.embedding_model} @ {device}，缓存路径: {cache_dir}")
+
     try:
         from langchain_huggingface import HuggingFaceEmbeddings
     except ImportError:
@@ -33,6 +48,7 @@ def _make_embeddings(cfg):
         model_name=cfg.embedding_model,
         model_kwargs={"device": device},
         encode_kwargs={"normalize_embeddings": True},
+        cache_folder=cache_dir,
     )
 
 
