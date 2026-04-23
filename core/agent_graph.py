@@ -182,26 +182,11 @@ def build_agent(cfg, kb, all_tools: list):
     graph.add_conditional_edges("llm", should_continue, {"tools": "tools", END: END})
     graph.add_edge("tools", "llm")
 
-    # AsyncSqliteSaver 持久化对话（支持 ainvoke）
-    # 需要：pip install langgraph-checkpoint-sqlite aiosqlite
-    checkpointer = None
-    try:
-        from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
-        checkpointer = AsyncSqliteSaver.from_conn_string(str(DB_PATH))
-        logger.info("使用 AsyncSQLite 持久化对话记录")
-    except ImportError:
-        pass
-    if checkpointer is None:
-        try:
-            # 部分版本路径不同
-            from langgraph_checkpoint_sqlite import AsyncSqliteSaver
-            checkpointer = AsyncSqliteSaver.from_conn_string(str(DB_PATH))
-            logger.info("使用 AsyncSQLite 持久化对话记录（备用路径）")
-        except ImportError:
-            pass
-    if checkpointer is None:
-        logger.warning("AsyncSQLite checkpointer 不可用，回退到内存。请安装：pip install langgraph-checkpoint-sqlite aiosqlite")
-        from langgraph.checkpoint.memory import MemorySaver
-        checkpointer = MemorySaver()
+    # InMemorySaver：进程内持久化，支持 ainvoke，无需额外依赖。
+    # 对话消息的长期持久化由 core/database.py 的 messages 表负责，
+    # 重启后通过 /session load 从数据库恢复上下文。
+    from langgraph.checkpoint.memory import InMemorySaver
+    checkpointer = InMemorySaver()
+    logger.info("使用 InMemorySaver（对话消息持久化由 database.py 负责）")
 
     return graph.compile(checkpointer=checkpointer), llm
