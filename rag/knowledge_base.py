@@ -60,24 +60,52 @@ class KnowledgeBase:
       docs = kb.search("查询语句", k=5)
     """
 
+    # 状态常量
+    STATE_DISCONNECTED = "未连接"
+    STATE_INITIALIZING = "初始化中"
+    STATE_READY        = "初始化完成"
+
     def __init__(self, cfg):
         self._cfg = cfg
-        self._store = None       # 懒加载，首次搜索/导入时初始化
-        self._embeddings = None  # 同上
+        self._store = None
+        self._embeddings = None
+        self._state = self.STATE_INITIALIZING
+        self._init_error: str = ""
+        self._init_thread = None
+
+    @property
+    def state(self) -> str:
+        return self._state
+
+    def _background_init(self):
+        """后台线程：执行 PGVector 初始化（含建表/扩展操作）"""
+        try:
+            from langchain_postgres import PGVector
+            self._embeddings = _make_embeddings(self._cfg)
+            self._store = PGVector(
+                embeddings=self._embeddings,
+                collection_name=self._cfg.table,
+                connection=self._cfg.connection_string,
+                use_jsonb=True,
+            )
+            self._state = self.STATE_READY
+            logger.info("RAG 向量存储初始化完成")
+        except Exception as e:
+            self._state = self.STATE_DISCONNECTED
+            self._init_error = str(e)
+            logger.warning(f"RAG 向量存储初始化失败: {e}")
 
     def _ensure_store(self):
-        """懒加载：首次使用时才初始化 PGVector（含建表/扩展操作）"""
-        if self._store is not None:
-            return
-        from langchain_postgres import PGVector
-        self._embeddings = _make_embeddings(self._cfg)
-        self._store = PGVector(
-            embeddings=self._embeddings,
-            collection_name=self._cfg.table,
-            connection=self._cfg.connection_string,
-            use_jsonb=True,
-        )
-        logger.info("RAG 向量存储初始化完成")
+        """等待后台初始化完成，未就绪时打印提示并阻塞"""
+        if self._state == self.STATE_READY:
+            return True
+        if self._state == self.STATE_DISCONNECTED:
+            return False
+        # 初始化中：等待完成
+        print("⏳ RAG 知识库初始化中，请稍候...", flush=True)
+        if self._init_thread and self._init_thread.is_alive():
+            self._init_thread.join()
+        return self._state == self.STATE_READY
 
     # ------------------------------------------------------------------
     # 工厂方法
@@ -85,20 +113,23 @@ class KnowledgeBase:
     @classmethod
     def connect(cls, cfg) -> Optional["KnowledgeBase"]:
         """
-        启动时只做轻量连接检查（ping），不初始化 PGVector。
-        PGVector 的建表/扩展操作延迟到首次实际使用时执行。
+        启动时 ping 数据库验证连接，成功后在后台线程异步初始化 PGVector。
         """
         try:
             import psycopg2
-            # 只做一次轻量 ping，验证数据库可达
+            import threading
             conn = psycopg2.connect(
                 host=cfg.host, port=cfg.port, dbname=cfg.db,
                 user=cfg.user, password=cfg.password,
                 connect_timeout=5,
             )
             conn.close()
-            logger.info("RAG 知识库连接成功（向量存储将在首次使用时初始化）")
-            return cls(cfg)
+            logger.info("RAG 数据库连接成功，后台初始化向量存储...")
+            kb = cls(cfg)
+            t = threading.Thread(target=kb._background_init, daemon=True)
+            t.start()
+            kb._init_thread = t
+            return kb
         except Exception as e:
             logger.warning(f"RAG 连接失败（将以无知识库模式运行）: {e}")
             return None
@@ -151,7 +182,9 @@ class KnowledgeBase:
                 logger.warning(f"  跳过 {f.name}: {e}")
 
         if all_chunks:
-            self._ensure_store()
+            if not self._ensure_store():
+                logger.error("RAG 存储不可用，导入失败")
+                return 0
             self._store.add_documents(all_chunks)
             logger.info(f"导入完成：{len(all_chunks)} chunks from {len(files)} files")
         return len(all_chunks)
@@ -161,7 +194,8 @@ class KnowledgeBase:
     # ------------------------------------------------------------------
     def search(self, query: str, k: int = 5) -> list[dict]:
         """返回最相关的 k 个文档片段"""
-        self._ensure_store()
+        if not self._ensure_store():
+            return []
         results = self._store.similarity_search_with_relevance_scores(query, k=k)
         return [
             {
@@ -173,5 +207,6 @@ class KnowledgeBase:
         ]
 
     def as_retriever(self, k: int = 5):
-        self._ensure_store()
+        if not self._ensure_store():
+            return None
         return self._store.as_retriever(search_kwargs={"k": k})

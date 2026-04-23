@@ -505,6 +505,27 @@ def _handle_provider_cmd(parts: list[str]):
 # 斜杠指令总路由
 # ──────────────────────────────────────────
 
+def _handle_rag_cmd():
+    """显示 RAG 知识库状态"""
+    if _kb is None:
+        console.print(Panel(
+            "[red]未连接[/] — 数据库配置未填写或连接失败",
+            title="RAG 状态",
+        ))
+        return
+    state = _kb.state
+    color = {"初始化中": "yellow", "初始化完成": "green", "未连接": "red"}.get(state, "white")
+    extra = ""
+    if state == "未连接" and _kb._init_error:
+        extra = f"\n错误: {_kb._init_error}"
+    if state == "初始化完成":
+        extra = f"\n集合: {_kb._cfg.table}  |  数据库: {_kb._cfg.host}:{_kb._cfg.port}/{_kb._cfg.db}"
+    console.print(Panel(
+        f"[{color}]{state}[/]{extra}",
+        title="RAG 状态",
+    ))
+
+
 def _handle_slash(cmd: str, session_id: str, tools: list) -> str:
     """返回（可能更新的）session_id"""
     parts = cmd.strip().split()
@@ -522,6 +543,7 @@ def _handle_slash(cmd: str, session_id: str, tools: list) -> str:
             "/memory   [子命令]             管理长期记忆（list/set/delete）\n"
             "/task     [子命令]             后台任务（list/run/status）\n"
             "/tools                        列出所有工具\n"
+            "/rag                          查看 RAG 知识库状态\n"
             "/ingest <路径>                导入文档到知识库\n"
             "/clear                        清空当前对话记忆（新建会话）\n"
             "/quit                         退出",
@@ -548,6 +570,9 @@ def _handle_slash(cmd: str, session_id: str, tools: list) -> str:
         new_sid = _session_new()
         console.print("[yellow]已开启新对话[/]")
         return new_sid
+
+    elif name == "/rag":
+        _handle_rag_cmd()
 
     elif name == "/ingest":
         if len(parts) < 2:
