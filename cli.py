@@ -49,12 +49,16 @@ def _bootstrap():
 
     log_path = Path(config.log_file)
     log_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # 启动阶段：同时输出到终端和文件
+    _stderr_handler = logging.StreamHandler(sys.stderr)
+    _stderr_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
     logging.basicConfig(
         level=getattr(logging, config.log_level, logging.INFO),
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         handlers=[
             logging.FileHandler(log_path),
-            logging.StreamHandler(sys.stderr),
+            _stderr_handler,
         ],
     )
     for noisy in ["httpx", "httpcore", "anthropic", "urllib3", "openai"]:
@@ -93,6 +97,9 @@ def _bootstrap():
         from core.agent_graph import build_agent
         result = build_agent(config, kb, all_tools)
         _agent, _llm = result
+
+    # 启动完成：移除终端日志输出，后续日志静默写入文件
+    logging.getLogger().removeHandler(_stderr_handler)
 
     profile = config.providers.active()
     console.print(Panel(
