@@ -210,16 +210,29 @@ def _session_load(identifier: str) -> str | None:
     return None
 
 
-def _session_delete(sid_prefix: str):
+def _session_delete(identifier: str):
+    """支持序号（数字）或 ID 前缀两种方式，和 _session_load 逻辑一致"""
     from core.database import list_sessions, delete_session
     sessions = list_sessions(100)
-    for s in sessions:
-        if s["id"].startswith(sid_prefix):
-            if Confirm.ask(f"确认删除对话 '{s['name']}'？", default=False):
-                delete_session(s["id"])
-                console.print(f"[green]✓ 已删除[/]")
+    target = None
+    if identifier.isdigit():
+        idx = int(identifier) - 1
+        if 0 <= idx < len(sessions):
+            target = sessions[idx]
+        else:
+            console.print(f"[red]序号 {identifier} 超出范围（共 {len(sessions)} 个对话）[/]")
             return
-    console.print(f"[red]找不到对话[/]")
+    else:
+        for s in sessions:
+            if s["id"].startswith(identifier):
+                target = s
+                break
+    if target is None:
+        console.print(f"[red]找不到对话[/]")
+        return
+    if Confirm.ask(f"确认删除对话 '{target['name']}'？", default=False):
+        delete_session(target["id"])
+        console.print(f"[green]✓ 已删除[/]")
 
 
 def _handle_session_cmd(parts: list[str], current_sid: str) -> str:
@@ -240,8 +253,8 @@ def _handle_session_cmd(parts: list[str], current_sid: str) -> str:
         console.print(Panel(
             "/session list              列出所有对话\n"
             "/session new [名称]        新建对话\n"
-            "/session load <ID前缀>     加载已有对话\n"
-            "/session delete <ID前缀>   删除对话",
+            "/session load <序号/ID>    加载已有对话\n"
+            "/session delete <序号/ID>  删除对话",
             title="session 指令",
         ))
         return current_sid
@@ -521,9 +534,8 @@ def cli(ctx, query):
 def chat():
     """交互式对话（默认模式）"""
     tools = _bootstrap()
-    from core.database import create_session
-    session_id = create_session()
-    console.print(f"[dim]新对话 ID: [bold]{session_id[:8]}[/]。输入 /help 查看指令。[/]")
+    session_id = None  # 延迟创建：首次发消息时才建 session，避免空记录
+    console.print("[dim]输入问题后回车。[bold]/help[/] 查看指令，[bold]/quit[/] 退出。[/]")
 
     while True:
         try:
@@ -539,8 +551,18 @@ def chat():
             continue
 
         if user_input.startswith("/"):
-            session_id = _handle_slash(user_input, session_id, tools)
+            # /session 指令需要 session_id，若还未创建则传空字符串
+            new_sid = _handle_slash(user_input, session_id or "", tools)
+            # 如果指令切换/新建了 session，更新 session_id
+            if new_sid and new_sid != (session_id or ""):
+                session_id = new_sid
+                console.print(f"[dim]当前对话: [bold]{session_id[:8]}[/][/]")
             continue
+
+        # 首次发消息时创建 session
+        if session_id is None:
+            from core.database import create_session
+            session_id = create_session()
 
         with console.status("[bold cyan]思考中...", spinner="dots"):
             try:
