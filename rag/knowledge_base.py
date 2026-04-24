@@ -44,11 +44,12 @@ def _make_embeddings(cfg):
     except ImportError:
         from langchain_community.embeddings import HuggingFaceEmbeddings
 
-    # 禁用 sentence-transformers 的 tqdm 进度条
-    # 通过环境变量 TQDM_DISABLE 全局禁用，比替换 tqdm.tqdm 更可靠
-    import os
-    _prev = os.environ.get("TQDM_DISABLE", "")
+    # sentence-transformers 的进度条直接写 stderr，环境变量无效
+    # 临时重定向 stderr 到 StringIO 彻底屏蔽
+    import sys, io, os
     os.environ["TQDM_DISABLE"] = "1"
+    _old_stderr = sys.stderr
+    sys.stderr = io.StringIO()
 
     try:
         embeddings = HuggingFaceEmbeddings(
@@ -58,10 +59,7 @@ def _make_embeddings(cfg):
             cache_folder=cache_dir,
         )
     finally:
-        if _prev:
-            os.environ["TQDM_DISABLE"] = _prev
-        else:
-            os.environ.pop("TQDM_DISABLE", None)
+        sys.stderr = _old_stderr
 
     return embeddings
 
