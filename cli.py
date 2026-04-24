@@ -63,10 +63,11 @@ def _save_active_skills(skill_ids: list[str]):
 
 def _rebuild_agent_with_skills():
     """Skill 变更后重建 Agent（保留现有工具和 KB）"""
+    import logging
     from core.agent_graph import build_agent
     global _agent
     _agent, _ = build_agent(_cfg, _kb, _all_tools, skill_ids=_active_skills)
-    logger.info(f"Agent 已重建，激活 Skill: {_active_skills}")
+    logging.getLogger(__name__).info(f"Agent 已重建，激活 Skill: {_active_skills}")
 
 
 def _bootstrap():
