@@ -664,12 +664,20 @@ def _handle_slash(cmd: str, session_id: str, tools: list) -> str:
 
     elif name == "/ingest":
         if len(parts) < 2:
-            console.print("[red]用法: /ingest <路径>[/]")
+            console.print("[red]用法: /ingest <路径> [集合ID]\n先用 /rag new <名称> 创建集合[/]")
         elif _kb is None:
             console.print("[red]RAG 未启用[/]")
         else:
+            collection_id = parts[2] if len(parts) >= 3 else ""
+            if collection_id:
+                from core.database import get_collection
+                col = get_collection(collection_id)
+                if not col:
+                    console.print(f"[red]找不到集合 ID '{collection_id}'，请先用 /rag new 创建[/]")
+                    return session_id
+                console.print(f"[dim]导入到集合: {col['name']} ({collection_id})[/]")
             with console.status(f"导入 {parts[1]}..."):
-                n = _kb.ingest(parts[1])
+                n = _kb.ingest(parts[1], collection_id=collection_id)
             console.print(f"[green]✓ 导入完成：{n} 个文本块[/]")
 
     else:

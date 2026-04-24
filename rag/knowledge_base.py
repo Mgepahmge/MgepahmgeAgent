@@ -156,7 +156,10 @@ class KnowledgeBase:
         collection_id: 知识集合 ID（由 database.create_collection 生成）
         支持：.pdf .txt .md .py .cpp .java .docx .json .yaml
         """
-        from langchain.text_splitter import RecursiveCharacterTextSplitter
+        try:
+            from langchain_text_splitters import RecursiveCharacterTextSplitter
+        except ImportError:
+            from langchain.text_splitter import RecursiveCharacterTextSplitter
         from langchain_community.document_loaders import (
             PyPDFLoader, TextLoader, UnstructuredWordDocumentLoader,
         )
