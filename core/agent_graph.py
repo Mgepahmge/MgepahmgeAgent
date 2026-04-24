@@ -103,7 +103,10 @@ class AgentState(TypedDict):
 # 节点函数
 # ──────────────────────────────────────────
 
-def make_retrieve_node(kb):
+def make_retrieve_node(kb, knowledge_ids: list[str] | None = None):
+    """
+    knowledge_ids: Skill 指定的知识集合 ID 列表，None 表示检索全库
+    """
     def retrieve(state: AgentState) -> dict:
         if kb is None:
             return {"rag_context": ""}
@@ -114,7 +117,7 @@ def make_retrieve_node(kb):
         if not last_human:
             return {"rag_context": ""}
         query = last_human.content if isinstance(last_human.content, str) else ""
-        results = kb.search(query, k=4)
+        results = kb.search(query, k=4, collection_ids=knowledge_ids or None)
         if not results:
             return {"rag_context": ""}
         ctx = "\n\n".join(
@@ -126,7 +129,10 @@ def make_retrieve_node(kb):
     return retrieve
 
 
-def make_llm_node(llm_with_tools, workspace: str):
+def make_llm_node(llm_with_tools, workspace: str, skill_prompt: str = ""):
+    """
+    skill_prompt: 所有激活 Skill 的 system_prompt 拼接片段
+    """
     def call_llm(state: AgentState) -> dict:
         from core.memory import build_memory_prompt
         rag_ctx = state.get("rag_context", "")
@@ -135,6 +141,9 @@ def make_llm_node(llm_with_tools, workspace: str):
             workspace=workspace,
             memory_section=memory_section,
         )
+        # 追加 Skill 提示片段
+        if skill_prompt:
+            system_content += f"\n\n{skill_prompt}"
         if rag_ctx:
             system_content += f"\n\n【知识库检索结果】\n{rag_ctx}"
         messages = [SystemMessage(content=system_content)] + state["messages"]
@@ -154,8 +163,12 @@ def should_continue(state: AgentState) -> str:
 # 图组装
 # ──────────────────────────────────────────
 
-def build_agent(cfg, kb, all_tools: list):
+def build_agent(cfg, kb, all_tools: list, skill_ids: list[str] | None = None):
+    """
+    skill_ids: 激活的 Skill ID 列表，None 表示不使用任何 Skill
+    """
     from core.database import init_db
+    from core.skill_loader import skill_registry, merge_skills
     init_db()
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 
@@ -165,12 +178,21 @@ def build_agent(cfg, kb, all_tools: list):
             "没有激活的 LLM Provider，请用 /provider add 添加，或编辑 config/providers.json"
         )
 
-    llm = build_llm(profile)
-    llm_with_tools = llm.bind_tools(all_tools)
+    # 合并 Skill：追加 prompt、扩展工具、过滤知识
+    if skill_ids:
+        skill_prompt, merged_tools, knowledge_ids = merge_skills(
+            skill_ids, skill_registry, all_tools
+        )
+        logger.info(f"激活 Skill: {skill_ids}")
+    else:
+        skill_prompt, merged_tools, knowledge_ids = "", list(all_tools), []
 
-    retrieve_node = make_retrieve_node(kb)
-    llm_node = make_llm_node(llm_with_tools, cfg.workspace_dir)
-    tool_node = ToolNode(all_tools)
+    llm = build_llm(profile)
+    llm_with_tools = llm.bind_tools(merged_tools)
+
+    retrieve_node = make_retrieve_node(kb, knowledge_ids or None)
+    llm_node = make_llm_node(llm_with_tools, cfg.workspace_dir, skill_prompt)
+    tool_node = ToolNode(merged_tools)
 
     graph = StateGraph(AgentState)
     graph.add_node("retrieve", retrieve_node)

@@ -29,6 +29,7 @@ _cfg = None
 _all_tools = []
 _current_session_id = None
 _restored_sessions: set = set()  # 已从数据库恢复上下文的 session
+_active_skills: list[str] = []   # 当前激活的 Skill ID 列表
 _event_loop = None  # 持久化事件循环，保证 InMemorySaver 状态跨调用存活
 
 
@@ -38,6 +39,34 @@ def _get_loop():
         import asyncio
         _event_loop = asyncio.new_event_loop()
     return _event_loop
+
+
+def _load_active_skills() -> list[str]:
+    """从 config/active_skills.json 读取激活的 Skill ID 列表"""
+    import json
+    path = Path(__file__).parent / "config" / "active_skills.json"
+    if not path.exists():
+        return []
+    try:
+        return json.loads(path.read_text())
+    except Exception:
+        return []
+
+
+def _save_active_skills(skill_ids: list[str]):
+    """持久化激活的 Skill ID 列表"""
+    import json
+    path = Path(__file__).parent / "config" / "active_skills.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(skill_ids, ensure_ascii=False, indent=2))
+
+
+def _rebuild_agent_with_skills():
+    """Skill 变更后重建 Agent（保留现有工具和 KB）"""
+    from core.agent_graph import build_agent
+    global _agent
+    _agent, _ = build_agent(_cfg, _kb, _all_tools, skill_ids=_active_skills)
+    logger.info(f"Agent 已重建，激活 Skill: {_active_skills}")
 
 
 def _bootstrap():
@@ -102,13 +131,15 @@ def _bootstrap():
     logging.getLogger().removeHandler(_stderr_handler)
 
     profile = config.providers.active()
+    skill_display = ", ".join(_active_skills) if _active_skills else "[dim]无[/]"
     console.print(Panel(
         f"[bold green]Agent 就绪[/]\n"
         f"Provider : [cyan]{config.providers.active_name()}[/] "
         f"([dim]{profile.type} / {profile.model}[/])\n"
         f"工作目录 : [cyan]{config.workspace_dir}[/]\n"
         f"RAG 知识库: {'[green]已连接[/]' if kb else '[yellow]未启用[/]'}\n"
-        f"工具数量 : [cyan]{len(all_tools)}[/]",
+        f"工具数量 : [cyan]{len(all_tools)}[/]\n"
+        f"激活 Skill: {skill_display}",
         title="🤖 CLI Agent",
         border_style="cyan",
     ))
@@ -587,6 +618,112 @@ def _handle_provider_cmd(parts: list[str]):
 # 斜杠指令总路由
 # ──────────────────────────────────────────
 
+# ──────────────────────────────────────────
+# /skill 指令
+# ──────────────────────────────────────────
+
+def _skill_list():
+    """列出所有可用 Skill，标记已激活的"""
+    from core.skill_loader import skill_registry
+    skills = skill_registry.all()
+    if not skills:
+        console.print("[dim]skills/ 目录下暂无 Skill（example.yaml 不计入）[/]")
+        console.print("[dim]新建 skills/<名称>.yaml 即可添加[/]")
+        return
+    table = Table(title="可用 Skill", border_style="cyan")
+    table.add_column("", width=2)
+    table.add_column("ID", style="bold")
+    table.add_column("名称")
+    table.add_column("描述")
+    table.add_column("工具", style="dim")
+    table.add_column("知识", style="dim")
+    for s in skills:
+        marker = "[green]●[/]" if s.id in _active_skills else " "
+        tools_str = ", ".join(s.tools) if s.tools else "-"
+        know_str = ", ".join(s.knowledge) if s.knowledge else "-"
+        table.add_row(marker, s.id, s.name, s.description or "-",
+                      tools_str, know_str)
+    console.print(table)
+    if _active_skills:
+        console.print(f"[dim]当前激活: {', '.join(_active_skills)}[/]")
+
+
+def _skill_enable(sid: str):
+    from core.skill_loader import skill_registry
+    if not skill_registry.exists(sid):
+        console.print(f"[red]Skill '{sid}' 不存在，请检查 skills/{sid}.yaml[/]")
+        return
+    if sid in _active_skills:
+        console.print(f"[yellow]Skill '{sid}' 已处于激活状态[/]")
+        return
+    _active_skills.append(sid)
+    _save_active_skills(_active_skills)
+    _rebuild_agent_with_skills()
+    skill = skill_registry.get(sid)
+    console.print(f"[green]✓ 已激活 Skill: {skill.name}[/]")
+
+
+def _skill_disable(sid: str):
+    if sid not in _active_skills:
+        console.print(f"[yellow]Skill '{sid}' 未激活[/]")
+        return
+    _active_skills.remove(sid)
+    _save_active_skills(_active_skills)
+    _rebuild_agent_with_skills()
+    console.print(f"[green]✓ 已停用 Skill: {sid}[/]")
+
+
+def _skill_show(sid: str):
+    from core.skill_loader import skill_registry
+    skill = skill_registry.get(sid)
+    if skill is None:
+        console.print(f"[red]Skill '{sid}' 不存在[/]")
+        return
+    status = "[green]已激活[/]" if sid in _active_skills else "[dim]未激活[/]"
+    tools_str = "\n  ".join(skill.tools) if skill.tools else "(无)"
+    know_str = "\n  ".join(skill.knowledge) if skill.knowledge else "(无)"
+    prompt_preview = skill.system_prompt[:200] + "..." if len(skill.system_prompt) > 200 else skill.system_prompt
+    console.print(Panel(
+        f"ID: [bold]{skill.id}[/]  {status}\n"
+        f"名称: {skill.name}\n"
+        f"描述: {skill.description or '(无)'}\n"
+        f"工具:\n  {tools_str}\n"
+        f"知识集合:\n  {know_str}\n"
+        f"System Prompt 预览:\n{prompt_preview}",
+        title="Skill 详情",
+    ))
+
+
+def _skill_reload():
+    from core.skill_loader import skill_registry
+    skill_registry.reload()
+    _rebuild_agent_with_skills()
+    console.print(f"[green]✓ 已重载所有 Skill（共 {len(skill_registry.all())} 个）[/]")
+
+
+def _handle_skill_cmd(parts: list[str]):
+    sub = parts[1] if len(parts) > 1 else "list"
+    if sub in ("list", "ls"):
+        _skill_list()
+    elif sub in ("enable", "on") and len(parts) >= 3:
+        _skill_enable(parts[2])
+    elif sub in ("disable", "off") and len(parts) >= 3:
+        _skill_disable(parts[2])
+    elif sub == "show" and len(parts) >= 3:
+        _skill_show(parts[2])
+    elif sub == "reload":
+        _skill_reload()
+    else:
+        console.print(Panel(
+            "/skill list                  列出所有 Skill（● 标记已激活）\n"
+            "/skill enable  <ID>          激活 Skill\n"
+            "/skill disable <ID>          停用 Skill\n"
+            "/skill show    <ID>          查看 Skill 详情\n"
+            "/skill reload                重新扫描 skills/ 目录",
+            title="skill 指令",
+        ))
+
+
 def _handle_rag_cmd(parts: list[str]):
     """RAG 知识库管理"""
     sub = parts[1] if len(parts) > 1 else "status"
@@ -706,6 +843,7 @@ def _handle_slash(cmd: str, session_id: str, tools: list) -> str:
             "/memory   [子命令]             管理长期记忆（list/set/delete，支持序号）\n"
             "/task     [子命令]             后台任务（list/run/status）\n"
             "/tools                        列出所有工具\n"
+            "/skill [list/enable/disable/show]   管理 Skill\n"
             "/rag [status/list/new/show/delete]  管理 RAG 知识集合\n"
             "/ingest <路径> [集合ID]        导入文档到知识库\n"
             "/clear                        清空当前对话记忆（新建会话）\n"
@@ -733,6 +871,9 @@ def _handle_slash(cmd: str, session_id: str, tools: list) -> str:
         new_sid = _session_new()
         console.print("[yellow]已开启新对话[/]")
         return new_sid
+
+    elif name == "/skill":
+        _handle_skill_cmd(parts)
 
     elif name == "/rag":
         _handle_rag_cmd(parts)
@@ -801,6 +942,7 @@ def chat():
         "/task", "/task list", "/task run", "/task status",
         "/provider", "/provider list", "/provider use", "/provider add",
         "/tools", "/ingest", "/clear",
+        "/skill", "/skill list", "/skill enable", "/skill disable", "/skill show", "/skill reload",
         "/rag", "/rag status", "/rag list", "/rag new", "/rag show", "/rag delete",
     ]
     _completer = WordCompleter(_slash_commands, match_middle=False, sentence=True)

@@ -1,0 +1,23 @@
+# Skill 配置示例
+# 文件名（不含 .yaml）即为此 Skill 的唯一 ID
+
+# 显示名称
+name: 示例技能
+
+# 描述（在 /skill list 中显示）
+description: 这是一个示例技能，展示 Skill 配置格式
+
+# 追加到 Agent System Prompt 末尾的提示片段
+# 支持多行，使用 YAML 块标量语法
+system_prompt: |
+  你同时还具备以下专业能力：
+  - 示例能力1：做某件事的专业建议
+  - 示例能力2：另一项专业知识
+
+# 此 Skill 额外提供的工具（从 tools/ 插件中按名称选取）
+# 留空或省略表示不附加额外工具
+tools: []
+
+# 此 Skill 关联的知识集合 ID 列表（RAG）
+# 留空或省略表示不附加额外知识
+knowledge: []
