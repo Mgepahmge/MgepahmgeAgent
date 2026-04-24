@@ -130,7 +130,7 @@ def make_llm_node(llm_with_tools, workspace: str):
     def call_llm(state: AgentState) -> dict:
         from core.memory import build_memory_prompt
         rag_ctx = state.get("rag_context", "")
-        memory_section = build_memory_prompt()
+        memory_section = build_memory_prompt(agent_id="")
         system_content = SYSTEM_PROMPT.format(
             workspace=workspace,
             memory_section=memory_section,

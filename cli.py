@@ -327,46 +327,121 @@ def _handle_session_cmd(parts: list[str], current_sid: str) -> str:
 # /memory 指令
 # ──────────────────────────────────────────
 
-def _memory_list():
-    from core.database import load_all_memories
-    memories = load_all_memories()
+def _memory_list(scope: str = "all"):
+    """
+    列出长期记忆。
+    scope='all'    : 全局 + Agent 私有（默认）
+    scope='global' : 仅全局
+    scope='agent'  : 仅 Agent 私有
+    """
+    import time
+    from core.database import load_memories, load_all_memories
+
+    if scope == "global":
+        memories = load_memories(scope="global", agent_id="")
+        title = "全局长期记忆"
+    elif scope == "agent":
+        memories = load_memories(scope="agent", agent_id="")
+        title = "Agent 私有记忆"
+    else:
+        memories = load_all_memories(agent_id="")
+        title = "长期记忆（全局 + 私有）"
+
     if not memories:
-        console.print("[dim]暂无长期记忆[/]")
+        console.print(f"[dim]暂无{title}[/]")
         return
-    table = Table(title="长期记忆", border_style="cyan")
+
+    table = Table(title=title, border_style="cyan")
+    table.add_column("#", width=4, style="bold cyan")
+    table.add_column("类型", width=6)
     table.add_column("键", style="bold")
     table.add_column("内容")
-    table.add_column("来源", style="dim")
-    for m in memories:
-        table.add_row(m["key"], m["value"], m["source"] or "-")
+    table.add_column("来源", style="dim", width=8)
+    table.add_column("更新时间", style="dim", width=12)
+
+    for i, m in enumerate(memories, 1):
+        scope_label = "[cyan]全局[/]" if m["scope"] == "global" else "[yellow]私有[/]"
+        ts = time.strftime("%m-%d %H:%M", time.localtime(m["updated_at"]))
+        table.add_row(str(i), scope_label, m["key"], m["value"],
+                      m["source"] or "-", ts)
     console.print(table)
 
 
-def _memory_set(key: str, value: str):
+def _memory_set(key: str, value: str, scope: str = "global"):
     from core.database import save_memory
-    save_memory(key, value, source="manual")
-    console.print(f"[green]✓ 已保存记忆: {key}[/]")
+    save_memory(key, value, source="manual", scope=scope, agent_id="")
+    scope_label = "全局" if scope == "global" else "Agent私有"
+    console.print(f"[green]✓ 已保存{scope_label}记忆: {key}[/]")
 
 
-def _memory_delete(key: str):
-    from core.database import delete_memory
-    delete_memory(key)
-    console.print(f"[green]✓ 已删除记忆: {key}[/]")
+def _memory_delete(identifier: str, scope: str = "all"):
+    """
+    按序号或键名删除记忆。
+    identifier: 数字序号（基于当前列表）或键名
+    scope: 'global' / 'agent' / 'all'（序号模式下必须指定具体 scope）
+    """
+    from core.database import (
+        load_memories, load_all_memories,
+        delete_memory_by_id, delete_memory_by_key, find_memory_by_identifier
+    )
+
+    if identifier.isdigit():
+        # 序号模式：先获取对应列表
+        if scope == "all":
+            memories = load_all_memories(agent_id="")
+        else:
+            memories = load_memories(scope=scope, agent_id="")
+        idx = int(identifier) - 1
+        if not (0 <= idx < len(memories)):
+            console.print(f"[red]序号 {identifier} 超出范围（共 {len(memories)} 条）[/]")
+            return
+        target = memories[idx]
+        delete_memory_by_id(target["id"])
+        console.print(f"[green]✓ 已删除记忆: {target['key']}[/]")
+    else:
+        # 键名模式
+        if scope == "all":
+            # 键名模式下尝试全局，找不到再试私有
+            from core.database import find_memory_by_identifier as _find
+            target = _find(identifier, scope="global", agent_id="")
+            if not target:
+                target = _find(identifier, scope="agent", agent_id="")
+            if not target:
+                console.print(f"[red]找不到记忆键: {identifier}[/]")
+                return
+            delete_memory_by_id(target["id"])
+        else:
+            delete_memory_by_key(identifier, scope=scope, agent_id="")
+        console.print(f"[green]✓ 已删除记忆: {identifier}[/]")
 
 
 def _handle_memory_cmd(parts: list[str]):
     sub = parts[1] if len(parts) > 1 else "list"
+
     if sub in ("list", "ls"):
-        _memory_list()
-    elif sub == "set" and len(parts) > 3:
-        _memory_set(parts[2], " ".join(parts[3:]))
-    elif sub in ("delete", "rm") and len(parts) > 2:
-        _memory_delete(parts[2])
+        # /memory list [global|agent|all]
+        scope = parts[2] if len(parts) > 2 else "all"
+        _memory_list(scope)
+
+    elif sub == "set" and len(parts) >= 4:
+        # /memory set <键> <值> [global|agent]
+        scope = parts[-1] if parts[-1] in ("global", "agent") else "global"
+        if parts[-1] in ("global", "agent"):
+            value = " ".join(parts[3:-1])
+        else:
+            value = " ".join(parts[3:])
+        _memory_set(parts[2], value, scope)
+
+    elif sub in ("delete", "rm", "del") and len(parts) >= 3:
+        # /memory delete <序号/键名> [global|agent|all]
+        scope = parts[3] if len(parts) > 3 and parts[3] in ("global", "agent", "all") else "all"
+        _memory_delete(parts[2], scope)
+
     else:
         console.print(Panel(
-            "/memory list                列出所有记忆\n"
-            "/memory set <键> <值>       手动添加记忆\n"
-            "/memory delete <键>         删除记忆",
+            "/memory list [global|agent|all]          列出记忆（默认 all）\n"
+            "/memory set <键> <值> [global|agent]     保存记忆（默认 global）\n"
+            "/memory delete <序号/键名> [scope]        按序号或键名删除",
             title="memory 指令",
         ))
 
@@ -628,7 +703,7 @@ def _handle_slash(cmd: str, session_id: str, tools: list) -> str:
             "/help                         显示帮助\n"
             "/provider [子命令]             管理 LLM Provider\n"
             "/session  [子命令]             管理对话记录（list/new/load/delete）\n"
-            "/memory   [子命令]             管理长期记忆（list/set/delete）\n"
+            "/memory   [子命令]             管理长期记忆（list/set/delete，支持序号）\n"
             "/task     [子命令]             后台任务（list/run/status）\n"
             "/tools                        列出所有工具\n"
             "/rag [status/list/new/show/delete]  管理 RAG 知识集合\n"
@@ -721,7 +796,8 @@ def chat():
     _slash_commands = [
         "/help", "/quit", "/exit",
         "/session", "/session list", "/session new", "/session load", "/session delete",
-        "/memory", "/memory list", "/memory set", "/memory delete",
+        "/memory", "/memory list", "/memory list global", "/memory list agent",
+        "/memory set", "/memory delete",
         "/task", "/task list", "/task run", "/task status",
         "/provider", "/provider list", "/provider use", "/provider add",
         "/tools", "/ingest", "/clear",
