@@ -149,9 +149,11 @@ class KnowledgeBase:
     # ------------------------------------------------------------------
     # 文档导入
     # ------------------------------------------------------------------
-    def ingest(self, path: str, chunk_size: int = 800, chunk_overlap: int = 150) -> int:
+    def ingest(self, path: str, chunk_size: int = 800, chunk_overlap: int = 150,
+               collection_id: str = "") -> int:
         """
-        导入文件或目录，返回写入的 chunk 数量。
+        导入文件或目录到指定知识集合，返回写入的 chunk 数量。
+        collection_id: 知识集合 ID（由 database.create_collection 生成）
         支持：.pdf .txt .md .py .cpp .java .docx .json .yaml
         """
         from langchain.text_splitter import RecursiveCharacterTextSplitter
@@ -197,28 +199,62 @@ class KnowledgeBase:
             if not self._ensure_store():
                 logger.error("RAG 存储不可用，导入失败")
                 return 0
+            # 将 collection_id 写入每个 chunk 的 metadata
+            if collection_id:
+                for c in all_chunks:
+                    c.metadata["collection_id"] = collection_id
             self._store.add_documents(all_chunks)
+            # 更新集合计数
+            if collection_id:
+                from core.database import update_collection_count
+                update_collection_count(collection_id, len(all_chunks))
             logger.info(f"导入完成：{len(all_chunks)} chunks from {len(files)} files")
         return len(all_chunks)
 
     # ------------------------------------------------------------------
     # 检索
     # ------------------------------------------------------------------
-    def search(self, query: str, k: int = 5) -> list[dict]:
-        """返回最相关的 k 个文档片段"""
+    def search(self, query: str, k: int = 5,
+               collection_ids: list[str] | None = None) -> list[dict]:
+        """
+        返回最相关的 k 个文档片段。
+        collection_ids: 限定检索范围，None 表示检索全库。
+        """
         if not self._ensure_store():
             return []
-        results = self._store.similarity_search_with_relevance_scores(query, k=k)
+        filter_dict = None
+        if collection_ids:
+            filter_dict = {"collection_id": {"$in": collection_ids}}
+        results = self._store.similarity_search_with_relevance_scores(
+            query, k=k, filter=filter_dict
+        )
         return [
             {
                 "content": doc.page_content,
                 "source": doc.metadata.get("source", "unknown"),
+                "collection_id": doc.metadata.get("collection_id", ""),
                 "score": round(float(score), 4),
             }
             for doc, score in results
         ]
 
-    def as_retriever(self, k: int = 5):
+    def as_retriever(self, k: int = 5,
+                     collection_ids: list[str] | None = None):
         if not self._ensure_store():
             return None
-        return self._store.as_retriever(search_kwargs={"k": k})
+        search_kwargs = {"k": k}
+        if collection_ids:
+            search_kwargs["filter"] = {"collection_id": {"$in": collection_ids}}
+        return self._store.as_retriever(search_kwargs=search_kwargs)
+
+    def delete_collection_docs(self, collection_id: str) -> bool:
+        """删除指定集合的所有文档"""
+        if not self._ensure_store():
+            return False
+        try:
+            # pgvector 通过 metadata 过滤删除
+            self._store.delete(filter={"collection_id": collection_id})
+            return True
+        except Exception as e:
+            logger.warning(f"删除集合文档失败: {e}")
+            return False

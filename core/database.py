@@ -56,6 +56,16 @@ def init_db():
             updated_at REAL
         );
 
+        -- 知识集合表（RAG）
+        CREATE TABLE IF NOT EXISTS knowledge_collections (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            description TEXT DEFAULT '',
+            doc_count INTEGER DEFAULT 0,
+            created_at REAL,
+            updated_at REAL
+        );
+
         -- 后台任务表
         CREATE TABLE IF NOT EXISTS tasks (
             id TEXT PRIMARY KEY,
@@ -210,3 +220,66 @@ def list_tasks(limit: int = 20) -> list[dict]:
             "SELECT * FROM tasks ORDER BY created_at DESC LIMIT ?", (limit,)
         ).fetchall()
     return [dict(r) for r in rows]
+
+
+# ──────────────────────────────────────────
+# 知识集合管理（RAG）
+# ──────────────────────────────────────────
+
+def create_collection(name: str, description: str = "") -> str:
+    """创建知识集合，返回固定 UUID"""
+    cid = str(uuid.uuid4())[:8]
+    now = time.time()
+    with get_conn() as conn:
+        conn.execute(
+            "INSERT INTO knowledge_collections (id, name, description, doc_count, created_at, updated_at) "
+            "VALUES (?,?,?,0,?,?)",
+            (cid, name, description, now, now)
+        )
+    return cid
+
+
+def get_collection(cid: str) -> Optional[dict]:
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM knowledge_collections WHERE id=?", (cid,)
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def list_collections() -> list[dict]:
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM knowledge_collections ORDER BY updated_at DESC"
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def update_collection_count(cid: str, delta: int):
+    """更新集合文档计数"""
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE knowledge_collections SET doc_count=MAX(0, doc_count+?), updated_at=? WHERE id=?",
+            (delta, time.time(), cid)
+        )
+
+
+def delete_collection(cid: str):
+    with get_conn() as conn:
+        conn.execute("DELETE FROM knowledge_collections WHERE id=?", (cid,))
+
+
+def find_collection_by_identifier(identifier: str) -> Optional[dict]:
+    """按序号（数字）或 ID 前缀查找集合"""
+    if identifier.isdigit():
+        cols = list_collections()
+        idx = int(identifier) - 1
+        if 0 <= idx < len(cols):
+            return cols[idx]
+        return None
+    # ID 前缀匹配
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM knowledge_collections WHERE id LIKE ?", (identifier + "%",)
+        ).fetchone()
+    return dict(row) if row else None

@@ -512,13 +512,34 @@ def _handle_provider_cmd(parts: list[str]):
 # 斜杠指令总路由
 # ──────────────────────────────────────────
 
-def _handle_rag_cmd():
-    """显示 RAG 知识库状态"""
-    if _kb is None:
+def _handle_rag_cmd(parts: list[str]):
+    """RAG 知识库管理"""
+    sub = parts[1] if len(parts) > 1 else "status"
+
+    if sub == "status":
+        _rag_status()
+    elif sub in ("list", "ls"):
+        _rag_list()
+    elif sub == "new" and len(parts) >= 3:
+        _rag_new(" ".join(parts[2:]))
+    elif sub in ("delete", "rm") and len(parts) >= 3:
+        _rag_delete(parts[2])
+    elif sub == "show" and len(parts) >= 3:
+        _rag_show(parts[2])
+    else:
         console.print(Panel(
-            "[red]未连接[/] — 数据库配置未填写或连接失败",
-            title="RAG 状态",
+            "/rag status              RAG 连接状态\n"
+            "/rag list                列出所有知识集合\n"
+            "/rag new <名称>          新建知识集合\n"
+            "/rag show <序号/ID>      查看集合详情\n"
+            "/rag delete <序号/ID>    删除集合及其文档",
+            title="RAG 指令",
         ))
+
+
+def _rag_status():
+    if _kb is None:
+        console.print(Panel("[red]未连接[/] — 数据库配置未填写或连接失败", title="RAG 状态"))
         return
     state = _kb.state
     color = {"初始化中": "yellow", "初始化完成": "green", "未连接": "red"}.get(state, "white")
@@ -526,11 +547,71 @@ def _handle_rag_cmd():
     if state == "未连接" and _kb._init_error:
         extra = f"\n错误: {_kb._init_error}"
     if state == "初始化完成":
-        extra = f"\n集合: {_kb._cfg.table}  |  数据库: {_kb._cfg.host}:{_kb._cfg.port}/{_kb._cfg.db}"
+        from core.database import list_collections
+        count = len(list_collections())
+        extra = f"\n数据库: {_kb._cfg.host}:{_kb._cfg.port}/{_kb._cfg.db}  |  知识集合: {count} 个"
+    console.print(Panel(f"[{color}]{state}[/]{extra}", title="RAG 状态"))
+
+
+def _rag_list():
+    from core.database import list_collections
+    import time
+    cols = list_collections()
+    if not cols:
+        console.print("[dim]暂无知识集合，使用 /rag new <名称> 创建[/]")
+        return
+    table = Table(title="知识集合", border_style="cyan")
+    table.add_column("#", width=4, style="bold cyan")
+    table.add_column("ID", style="dim", width=10)
+    table.add_column("名称")
+    table.add_column("文档块数", justify="right")
+    table.add_column("更新时间")
+    for i, c in enumerate(cols, 1):
+        ts = time.strftime("%m-%d %H:%M", time.localtime(c["updated_at"]))
+        table.add_row(str(i), c["id"], c["name"], str(c["doc_count"]), ts)
+    console.print(table)
+
+
+def _rag_new(name: str):
+    from core.database import create_collection
+    desc = ""
+    cid = create_collection(name, desc)
+    console.print(f"[green]✓ 已创建知识集合 '{name}'，ID: [bold]{cid}[/][/]")
+    console.print(f"[dim]导入文档：/ingest <路径> {cid}[/]")
+
+
+def _rag_show(identifier: str):
+    from core.database import find_collection_by_identifier
+    import time
+    c = find_collection_by_identifier(identifier)
+    if not c:
+        console.print(f"[red]找不到集合 '{identifier}'[/]")
+        return
+    ts_c = time.strftime("%Y-%m-%d %H:%M", time.localtime(c["created_at"]))
+    ts_u = time.strftime("%Y-%m-%d %H:%M", time.localtime(c["updated_at"]))
     console.print(Panel(
-        f"[{color}]{state}[/]{extra}",
-        title="RAG 状态",
+        f"ID: [bold]{c['id']}[/]\n"
+        f"名称: {c['name']}\n"
+        f"描述: {c['description'] or '(无)'}\n"
+        f"文档块数: {c['doc_count']}\n"
+        f"创建时间: {ts_c}\n"
+        f"更新时间: {ts_u}",
+        title="知识集合详情",
     ))
+
+
+def _rag_delete(identifier: str):
+    from core.database import find_collection_by_identifier, delete_collection
+    c = find_collection_by_identifier(identifier)
+    if not c:
+        console.print(f"[red]找不到集合 '{identifier}'[/]")
+        return
+    if not Confirm.ask(f"确认删除集合 '{c['name']}' 及其所有文档？", default=False):
+        return
+    if _kb:
+        _kb.delete_collection_docs(c["id"])
+    delete_collection(c["id"])
+    console.print(f"[green]✓ 已删除集合 '{c['name']}'[/]")
 
 
 def _handle_slash(cmd: str, session_id: str, tools: list) -> str:
@@ -550,8 +631,8 @@ def _handle_slash(cmd: str, session_id: str, tools: list) -> str:
             "/memory   [子命令]             管理长期记忆（list/set/delete）\n"
             "/task     [子命令]             后台任务（list/run/status）\n"
             "/tools                        列出所有工具\n"
-            "/rag                          查看 RAG 知识库状态\n"
-            "/ingest <路径>                导入文档到知识库\n"
+            "/rag [status/list/new/show/delete]  管理 RAG 知识集合\n"
+            "/ingest <路径> [集合ID]        导入文档到知识库\n"
             "/clear                        清空当前对话记忆（新建会话）\n"
             "/quit                         退出",
             title="指令列表",
@@ -579,7 +660,7 @@ def _handle_slash(cmd: str, session_id: str, tools: list) -> str:
         return new_sid
 
     elif name == "/rag":
-        _handle_rag_cmd()
+        _handle_rag_cmd(parts)
 
     elif name == "/ingest":
         if len(parts) < 2:
@@ -636,6 +717,7 @@ def chat():
         "/task", "/task list", "/task run", "/task status",
         "/provider", "/provider list", "/provider use", "/provider add",
         "/tools", "/ingest", "/clear",
+        "/rag", "/rag status", "/rag list", "/rag new", "/rag show", "/rag delete",
     ]
     _completer = WordCompleter(_slash_commands, match_middle=False, sentence=True)
 
