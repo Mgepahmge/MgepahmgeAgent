@@ -44,12 +44,24 @@ def _make_embeddings(cfg):
     except ImportError:
         from langchain_community.embeddings import HuggingFaceEmbeddings
 
-    return HuggingFaceEmbeddings(
-        model_name=cfg.embedding_model,
-        model_kwargs={"device": device},
-        encode_kwargs={"normalize_embeddings": True},
-        cache_folder=cache_dir,
-    )
+    # 禁用 sentence-transformers 的 tqdm 进度条（它直接写 stderr，不走 logging）
+    import tqdm
+    import functools
+    _original_tqdm = tqdm.tqdm
+    tqdm.tqdm = functools.partial(_original_tqdm, disable=True)
+
+    try:
+        embeddings = HuggingFaceEmbeddings(
+            model_name=cfg.embedding_model,
+            model_kwargs={"device": device},
+            encode_kwargs={"normalize_embeddings": True},
+            cache_folder=cache_dir,
+        )
+    finally:
+        # 恢复 tqdm，不影响其他地方的进度条
+        tqdm.tqdm = _original_tqdm
+
+    return embeddings
 
 
 class KnowledgeBase:
