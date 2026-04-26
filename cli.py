@@ -22,23 +22,15 @@ from prompt_toolkit.formatted_text import HTML
 
 console = Console()
 
-_agent = None
+_agent = None      # 兼容旧代码，指向当前 Agent 的 AgentRuntime
 _llm = None
 _kb = None
 _cfg = None
 _all_tools = []
 _current_session_id = None
-_restored_sessions: set = set()  # 已从数据库恢复上下文的 session
-_active_skills: list[str] = []   # 当前激活的 Skill ID 列表
-_event_loop = None  # 持久化事件循环，保证 InMemorySaver 状态跨调用存活
-
-
-def _get_loop():
-    global _event_loop
-    if _event_loop is None or _event_loop.is_closed():
-        import asyncio
-        _event_loop = asyncio.new_event_loop()
-    return _event_loop
+_restored_sessions: set = set()
+_active_skills: list[str] = []
+_current_agent_id: str = "default"   # 当前交互的 Agent ID
 
 
 def _load_active_skills() -> list[str]:
@@ -132,15 +124,22 @@ def _bootstrap():
     logging.getLogger().removeHandler(_stderr_handler)
 
     profile = config.providers.active()
-    skill_display = ", ".join(_active_skills) if _active_skills else "[dim]无[/]"
+    from core.agent_registry import agent_registry
+    runtime = agent_registry.get_runtime(_current_agent_id)
+    agent_profile = agent_registry.get_profile(_current_agent_id)
+    provider_name = (agent_profile.provider or config.providers.active_name()) if agent_profile else config.providers.active_name()
+    workdir_display = (agent_profile.workdir or config.workspace_dir) if agent_profile else config.workspace_dir
+    skills_display = ", ".join(agent_profile.skills) if agent_profile and agent_profile.skills else "[dim]无[/]"
     console.print(Panel(
         f"[bold green]Agent 就绪[/]\n"
-        f"Provider : [cyan]{config.providers.active_name()}[/] "
+        f"当前 Agent: [cyan]{_current_agent_id}[/] "
+        f"([dim]{agent_profile.name if agent_profile else '未知'}[/])\n"
+        f"Provider  : [cyan]{provider_name}[/] "
         f"([dim]{profile.type} / {profile.model}[/])\n"
-        f"工作目录 : [cyan]{config.workspace_dir}[/]\n"
+        f"工作目录  : [cyan]{workdir_display}[/]\n"
         f"RAG 知识库: {'[green]已连接[/]' if kb else '[yellow]未启用[/]'}\n"
-        f"工具数量 : [cyan]{len(all_tools)}[/]\n"
-        f"激活 Skill: {skill_display}",
+        f"工具数量  : [cyan]{len(runtime.tools) if runtime else len(all_tools)}[/]\n"
+        f"激活 Skill: {skills_display}",
         title="🤖 CLI Agent",
         border_style="cyan",
     ))
@@ -154,41 +153,18 @@ def _rebuild_agent():
 
 
 def _run_query(query: str, thread_id: str) -> str:
-    from langchain_core.messages import HumanMessage, AIMessage
-    from core.database import save_message, load_messages
+    from core.database import save_message
+    from core.agent_registry import agent_registry
 
     # 保存用户消息
     save_message(thread_id, "human", query)
 
-    async def _ainvoke():
-        # 如果是已加载的旧对话且尚未恢复上下文，先把历史消息注入
-        if thread_id not in _restored_sessions:
-            history = load_messages(thread_id)
-            # 取除最后一条（刚存入的当前问题）之外的所有历史
-            prior = history[:-1]
-            if prior:
-                prior_msgs = []
-                for m in prior:
-                    if m["role"] in ("human", "user"):
-                        prior_msgs.append(HumanMessage(content=m["content"]))
-                    elif m["role"] in ("assistant", "ai"):
-                        prior_msgs.append(AIMessage(content=m["content"]))
-                if prior_msgs:
-                    # 先把历史消息灌入 LangGraph，建立上下文
-                    await _agent.ainvoke(
-                        {"messages": prior_msgs, "workspace": _cfg.workspace_dir},
-                        config={"configurable": {"thread_id": thread_id}},
-                    )
-            _restored_sessions.add(thread_id)
+    # 通过当前 Agent 的 Runtime 调用（每个 Agent 有独立事件循环）
+    runtime = agent_registry.get_runtime(_current_agent_id)
+    if runtime is None:
+        return "当前 Agent 未启动，请检查配置"
 
-        result = await _agent.ainvoke(
-            {"messages": [HumanMessage(content=query)], "workspace": _cfg.workspace_dir},
-            config={"configurable": {"thread_id": thread_id}},
-        )
-        last = result["messages"][-1]
-        return last.content if hasattr(last, "content") else str(last)
-
-    answer = _get_loop().run_until_complete(_ainvoke())
+    answer = runtime.invoke(query, thread_id)
 
     # 保存 AI 回复
     save_message(thread_id, "assistant", answer)
@@ -620,6 +596,160 @@ def _handle_provider_cmd(parts: list[str]):
 # ──────────────────────────────────────────
 
 # ──────────────────────────────────────────
+# /agent 指令
+# ──────────────────────────────────────────
+
+def _agent_list():
+    """列出所有 Agent 配置，标记运行中和当前交互的"""
+    from core.agent_registry import agent_registry
+    profiles = agent_registry.profiles()
+    if not profiles:
+        console.print("[dim]agents/ 目录下暂无 Agent 配置[/]")
+        return
+    table = Table(title="Agent 列表", border_style="cyan")
+    table.add_column("", width=2)
+    table.add_column("ID", style="bold")
+    table.add_column("名称")
+    table.add_column("Provider", style="dim")
+    table.add_column("Skills", style="dim")
+    table.add_column("状态")
+    for p in profiles:
+        is_current = p.id == _current_agent_id
+        is_running = agent_registry.is_running(p.id)
+        marker = "[green]▶[/]" if is_current else " "
+        provider_str = p.provider or "[dim]全局默认[/]"
+        skills_str = ", ".join(p.skills) if p.skills else "[dim]-[/]"
+        status = "[green]运行中[/]" if is_running else "[dim]未启动[/]"
+        table.add_row(marker, p.id, p.name, provider_str, skills_str, status)
+    console.print(table)
+    console.print(f"[dim]▶ 当前交互: [bold]{_current_agent_id}[/][/]")
+
+
+def _agent_switch(aid: str) -> str:
+    """切换当前交互的 Agent，必要时自动启动"""
+    global _current_agent_id, _agent, _llm
+    from core.agent_registry import agent_registry
+
+    if not agent_registry.get_profile(aid):
+        console.print(f"[red]Agent '{aid}' 配置不存在，请检查 agents/{aid}.yaml[/]")
+        return _current_agent_id
+
+    # 启动（如果尚未运行）
+    if not agent_registry.is_running(aid):
+        with console.status(f"[cyan]启动 Agent [{aid}]...", spinner="dots"):
+            try:
+                runtime = agent_registry.start(aid, _cfg, _kb, _all_tools)
+            except Exception as e:
+                console.print(f"[red]Agent [{aid}] 启动失败: {e}[/]")
+                return _current_agent_id
+    else:
+        runtime = agent_registry.get_runtime(aid)
+
+    _current_agent_id = aid
+    _agent = runtime
+    _llm = runtime.llm
+    profile = agent_registry.get_profile(aid)
+    console.print(f"[green]✓ 已切换到 Agent: {profile.name} [{aid}][/]")
+    return aid
+
+
+def _agent_start(aid: str):
+    """后台启动一个 Agent（不切换当前交互）"""
+    from core.agent_registry import agent_registry
+    if agent_registry.is_running(aid):
+        console.print(f"[yellow]Agent [{aid}] 已在运行中[/]")
+        return
+    if not agent_registry.get_profile(aid):
+        console.print(f"[red]Agent '{aid}' 配置不存在[/]")
+        return
+    with console.status(f"[cyan]启动 Agent [{aid}]...", spinner="dots"):
+        try:
+            agent_registry.start(aid, _cfg, _kb, _all_tools)
+            profile = agent_registry.get_profile(aid)
+            console.print(f"[green]✓ Agent [{aid}] ({profile.name}) 已在后台启动[/]")
+        except Exception as e:
+            console.print(f"[red]Agent [{aid}] 启动失败: {e}[/]")
+
+
+def _agent_stop(aid: str):
+    """停止一个 Agent"""
+    global _current_agent_id
+    from core.agent_registry import agent_registry
+    if aid == _current_agent_id:
+        console.print(f"[red]无法停止当前正在交互的 Agent，请先切换到其他 Agent[/]")
+        return
+    if agent_registry.stop(aid):
+        console.print(f"[green]✓ Agent [{aid}] 已停止[/]")
+    else:
+        console.print(f"[yellow]Agent [{aid}] 未在运行[/]")
+
+
+def _agent_show(aid: str):
+    """查看 Agent 配置详情"""
+    from core.agent_registry import agent_registry
+    profile = agent_registry.get_profile(aid)
+    if profile is None:
+        console.print(f"[red]Agent '{aid}' 不存在[/]")
+        return
+    is_running = agent_registry.is_running(aid)
+    status = "[green]运行中[/]" if is_running else "[dim]未启动[/]"
+    tools_str = ", ".join(profile.base_tools) if profile.base_tools else "(全部)"
+    skills_str = ", ".join(profile.skills) if profile.skills else "(无)"
+    prompt_preview = (profile.system_prompt[:200] + "..."
+                      if len(profile.system_prompt) > 200
+                      else profile.system_prompt or "(无)")
+    console.print(Panel(
+        f"ID: [bold]{profile.id}[/]  {status}\n"
+        f"名称: {profile.name}\n"
+        f"描述: {profile.description or '(无)'}\n"
+        f"Provider: {profile.provider or '全局默认'}\n"
+        f"工作目录: {profile.workdir or '全局默认'}\n"
+        f"基础工具: {tools_str}\n"
+        f"Skills: {skills_str}\n"
+        f"全局记忆: {'✓' if profile.memory.use_global else '✗'}  "
+        f"私有记忆: {'✓' if profile.memory.use_private else '✗'}\n"
+        f"System Prompt 预览:\n{prompt_preview}",
+        title="Agent 详情",
+    ))
+
+
+def _agent_reload():
+    """重新扫描 agents/ 目录（不影响已运行的 Agent）"""
+    from core.agent_registry import agent_registry
+    agent_registry.reload_profiles()
+    count = len(agent_registry.profiles())
+    console.print(f"[green]✓ 已重载 Agent 配置（共 {count} 个）[/]")
+
+
+def _handle_agent_cmd(parts: list[str]) -> str:
+    """返回切换后的 agent_id（如果没有切换则返回空字符串）"""
+    sub = parts[1] if len(parts) > 1 else "list"
+    if sub in ("list", "ls"):
+        _agent_list()
+    elif sub in ("switch", "use") and len(parts) >= 3:
+        return _agent_switch(parts[2])
+    elif sub == "start" and len(parts) >= 3:
+        _agent_start(parts[2])
+    elif sub == "stop" and len(parts) >= 3:
+        _agent_stop(parts[2])
+    elif sub == "show" and len(parts) >= 3:
+        _agent_show(parts[2])
+    elif sub == "reload":
+        _agent_reload()
+    else:
+        console.print(Panel(
+            "/agent list                  列出所有 Agent（▶ 标记当前）\n"
+            "/agent switch <ID>           切换当前交互的 Agent\n"
+            "/agent start  <ID>           后台启动 Agent（不切换）\n"
+            "/agent stop   <ID>           停止 Agent\n"
+            "/agent show   <ID>           查看 Agent 配置详情\n"
+            "/agent reload                重新扫描 agents/ 目录",
+            title="agent 指令",
+        ))
+    return ""
+
+
+# ──────────────────────────────────────────
 # /skill 指令
 # ──────────────────────────────────────────
 
@@ -844,6 +974,7 @@ def _handle_slash(cmd: str, session_id: str, tools: list) -> str:
             "/memory   [子命令]             管理长期记忆（list/set/delete，支持序号）\n"
             "/task     [子命令]             后台任务（list/run/status）\n"
             "/tools                        列出所有工具\n"
+            "/agent [list/switch/start/stop/show] 管理 Agent\n"
             "/skill [list/enable/disable/show]   管理 Skill\n"
             "/rag [status/list/new/show/delete]  管理 RAG 知识集合\n"
             "/ingest <路径> [集合ID]        导入文档到知识库\n"
@@ -872,6 +1003,12 @@ def _handle_slash(cmd: str, session_id: str, tools: list) -> str:
         new_sid = _session_new()
         console.print("[yellow]已开启新对话[/]")
         return new_sid
+
+    elif name == "/agent":
+        new_aid = _handle_agent_cmd(parts)
+        if new_aid and new_aid != _current_agent_id:
+            global _current_agent_id
+            _current_agent_id = new_aid
 
     elif name == "/skill":
         _handle_skill_cmd(parts)
@@ -929,7 +1066,7 @@ def chat():
     """交互式对话（默认模式）"""
     tools = _bootstrap()
     session_id = None  # 延迟创建：首次发消息时才建 session，避免空记录
-    console.print("[dim]输入问题后回车。↑↓ 翻历史，Tab 补全指令，[bold]/help[/] 查看指令。[/]")
+    console.print(f"[dim]当前 Agent: [bold]{_current_agent_id}[/]。↑↓ 翻历史，Tab 补全，/help 查看指令。[/]")
 
     # 输入历史（↑↓ 翻历史）
     _history = InMemoryHistory()
@@ -943,6 +1080,8 @@ def chat():
         "/task", "/task list", "/task run", "/task status",
         "/provider", "/provider list", "/provider use", "/provider add",
         "/tools", "/ingest", "/clear",
+        "/agent", "/agent list", "/agent switch", "/agent start", "/agent stop",
+        "/agent show", "/agent reload",
         "/skill", "/skill list", "/skill enable", "/skill disable", "/skill show", "/skill reload",
         "/rag", "/rag status", "/rag list", "/rag new", "/rag show", "/rag delete",
     ]
