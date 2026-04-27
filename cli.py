@@ -1007,8 +1007,7 @@ def _handle_slash(cmd: str, session_id: str, tools: list) -> str:
     elif name == "/agent":
         new_aid = _handle_agent_cmd(parts)
         if new_aid and new_aid != _current_agent_id:
-            global _current_agent_id
-            _current_agent_id = new_aid
+            _agent_switch(new_aid)
 
     elif name == "/skill":
         _handle_skill_cmd(parts)
