@@ -165,14 +165,19 @@ def resolve_tool_refs(refs: list[str], all_tools: list) -> list:
 
 def merge_skills(skill_ids: list[str],
                  registry: SkillRegistry,
-                 all_tools: list) -> tuple[str, list, list[str]]:
+                 base_tools: list,
+                 full_tool_pool: list | None = None) -> tuple[str, list, list[str]]:
     """
     将指定 Skill 列表的能力合并，返回：
       (combined_prompt, merged_tools, combined_knowledge_ids)
 
-    - combined_prompt : 所有 Skill 的 system_prompt 拼接
-    - merged_tools    : all_tools + Skill 额外工具（按 resolve_tool_refs 解析）
-    - knowledge_ids   : 所有 Skill 的 knowledge 集合 ID（去重）
+    - combined_prompt  : 所有 Skill 的 system_prompt 拼接
+    - merged_tools     : base_tools + Skill 额外工具（去重）
+    - knowledge_ids    : 所有 Skill 的 knowledge 集合 ID（去重）
+
+    base_tools     : Agent 的基础工具集（已按 base_tools 配置过滤）
+    full_tool_pool : 全量注册工具，Skill.tools 从此范围内解析
+                     None 时回退到 base_tools（向后兼容）
     """
     prompt_parts: list[str] = []
     extra_refs: list[str] = []
@@ -192,13 +197,15 @@ def merge_skills(skill_ids: list[str],
                 knowledge_ids.append(kid)
                 seen_knowledge.add(kid)
 
-    # 合并工具：在 all_tools 基础上追加 Skill 额外指定的（去重）
-    seen = {t.name for t in all_tools}
+    # 合并工具：在 base_tools 基础上追加 Skill 额外指定的（去重）
+    # Skill 工具从 full_tool_pool 里解析，确保能找到不在 base_tools 里的工具
+    pool = full_tool_pool if full_tool_pool is not None else base_tools
+    seen = {t.name for t in base_tools}
     extra_tools = [
-        t for t in resolve_tool_refs(extra_refs, all_tools)
+        t for t in resolve_tool_refs(extra_refs, pool)
         if t.name not in seen
     ]
-    merged_tools = list(all_tools) + extra_tools
+    merged_tools = list(base_tools) + extra_tools
 
     combined_prompt = "\n\n".join(prompt_parts)
     return combined_prompt, merged_tools, knowledge_ids

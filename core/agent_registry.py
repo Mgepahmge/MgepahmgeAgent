@@ -278,10 +278,13 @@ class AgentRegistry:
             filtered_tools = list(all_tools)
 
         # 合并 Skill
+        # 注意：merge_skills 的第三个参数传 all_tools（全量），
+        # 这样 Skill 可以从全量工具中选取额外工具追加到 base_tools
+        # merge_skills 内部会以 filtered_tools 为基础追加 Skill 额外工具
         from core.skill_loader import skill_registry, merge_skills
         if profile.skills:
             skill_prompt, merged_tools, knowledge_ids = merge_skills(
-                profile.skills, skill_registry, filtered_tools
+                profile.skills, skill_registry, filtered_tools, all_tools
             )
         else:
             skill_prompt, merged_tools, knowledge_ids = "", filtered_tools, []

@@ -459,7 +459,7 @@ def _handle_memory_cmd(parts: list[str]):
 
 def _task_submit(description: str):
     from core.task_runner import submit_task
-    tid = submit_task(description, _agent, _cfg.workspace_dir)
+    tid = submit_task(description, _current_agent_id)
     console.print(f"[green]✓ 任务已提交，ID: [bold]{tid}[/]（用 /task status {tid} 查看进度）[/]")
 
 

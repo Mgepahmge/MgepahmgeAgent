@@ -1,60 +1,49 @@
 """
 task_runner.py - 后台任务队列
-支持提交长时间运行的任务在后台执行，不阻塞交互。
+
+提交任务后立即返回任务 ID，任务在 AgentRuntime 的独立事件循环里异步执行。
+与多 Agent 架构完全兼容：每个任务绑定到提交时的 AgentRuntime。
 """
 from __future__ import annotations
 import asyncio
 import logging
-import threading
 import time
 from .database import create_task, update_task, get_task, list_tasks
 
 logger = logging.getLogger(__name__)
 
-_loop: asyncio.AbstractEventLoop | None = None
-_thread: threading.Thread | None = None
 
-
-def _get_loop() -> asyncio.AbstractEventLoop:
-    global _loop, _thread
-    if _loop and _loop.is_running():
-        return _loop
-    _loop = asyncio.new_event_loop()
-
-    def _run(loop):
-        asyncio.set_event_loop(loop)
-        loop.run_forever()
-
-    _thread = threading.Thread(target=_run, args=(_loop,), daemon=True)
-    _thread.start()
-    return _loop
-
-
-def submit_task(description: str, agent, workspace: str) -> str:
+def submit_task(description: str, agent_id: str) -> str:
     """
     提交一个后台任务，立即返回任务 ID。
-    任务在独立事件循环里异步执行。
+    任务在指定 Agent 的独立事件循环里异步执行，不阻塞交互。
+
+    agent_id: 执行此任务的 Agent ID（对应 AgentRegistry 里的运行实例）
     """
+    from core.agent_registry import agent_registry
+    runtime = agent_registry.get_runtime(agent_id)
+    if runtime is None:
+        raise RuntimeError(f"Agent '{agent_id}' 未启动，无法提交任务")
+
+    # 为任务创建独立的 session ID，与交互对话隔离
+    task_session_id = f"task-{int(time.time())}"
+
     tid = create_task(description)
-    loop = _get_loop()
+    update_task(tid, status="running", started_at=time.time(), thread_id=task_session_id)
 
     async def _run():
-        update_task(tid, status="running", started_at=time.time())
         try:
-            from langchain_core.messages import HumanMessage
-            result = await agent.ainvoke(
-                {"messages": [HumanMessage(content=description)], "workspace": workspace},
-                config={"configurable": {"thread_id": f"task-{tid}"}},
-            )
-            last = result["messages"][-1]
-            output = last.content if hasattr(last, "content") else str(last)
-            update_task(tid, status="done", result=output[:4000], finished_at=time.time())
-            logger.info(f"任务 {tid} 完成")
+            output = await runtime._ainvoke(description, task_session_id)
+            update_task(tid, status="done",
+                        result=output[:4000], finished_at=time.time())
+            logger.info(f"任务 [{tid}] 完成（Agent: {agent_id}）")
         except Exception as e:
-            update_task(tid, status="error", error=str(e), finished_at=time.time())
-            logger.error(f"任务 {tid} 失败: {e}")
+            update_task(tid, status="error",
+                        error=str(e), finished_at=time.time())
+            logger.error(f"任务 [{tid}] 失败: {e}")
 
-    asyncio.run_coroutine_threadsafe(_run(), loop)
+    # 在 Agent 自己的事件循环里提交，保持工具和上下文的一致性
+    asyncio.run_coroutine_threadsafe(_run(), runtime._loop)
     return tid
 
 
