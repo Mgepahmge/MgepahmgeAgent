@@ -182,41 +182,35 @@ def _wrap_one(tool_obj, cache: ToolCache):
     """
     包装单个工具，在调用前查缓存，调用后写缓存。
     保留原始工具的所有属性（name, description, _source 等）。
+
+    注意：LangChain 新版本会把 config、run_manager 等内部参数通过 kwargs 传入，
+    这些参数不能参与缓存 key 计算，需要在透传时剔除。
     """
     original_run = tool_obj._run
 
-    def cached_run(*args, **kwargs) -> str:
-        # LangChain 工具调用时参数通过 kwargs 传入
-        tool_kwargs = kwargs if kwargs else {}
-        if args:
-            # positional args 的情况：尝试从 tool schema 映射
-            try:
-                import inspect
-                sig = inspect.signature(original_run)
-                params = list(sig.parameters.keys())
-                for i, a in enumerate(args):
-                    if i < len(params):
-                        tool_kwargs[params[i]] = a
-            except Exception:
-                pass
+    # LangChain 内部注入的参数，不参与缓存 key，但必须透传
+    _INTERNAL_KWARGS = {"config", "run_manager", "callbacks", "tags", "metadata"}
 
-        if cache.should_cache(tool_obj.name, tool_kwargs):
-            cached = cache.get(tool_obj.name, tool_kwargs)
+    def cached_run(*args, **kwargs) -> str:
+        # 分离业务参数和内部参数
+        internal_kwargs = {k: v for k, v in kwargs.items() if k in _INTERNAL_KWARGS}
+        business_kwargs = {k: v for k, v in kwargs.items() if k not in _INTERNAL_KWARGS}
+
+        if cache.should_cache(tool_obj.name, business_kwargs):
+            cached = cache.get(tool_obj.name, business_kwargs)
             if cached is not None:
                 return cached
 
+        # 完整透传所有参数（含 config 等内部参数）
         result = original_run(*args, **kwargs)
 
-        if cache.should_cache(tool_obj.name, tool_kwargs):
-            cache.set(tool_obj.name, tool_kwargs, result)
-            # 写操作后使 run_shell 缓存失效
-            if tool_obj.name != "run_shell":
-                pass
-            elif not _is_shell_readonly(tool_kwargs.get("command", "")):
-                cache.invalidate("run_shell")
+        if cache.should_cache(tool_obj.name, business_kwargs):
+            cache.set(tool_obj.name, business_kwargs, result)
+            if tool_obj.name == "run_shell":
+                if not _is_shell_readonly(business_kwargs.get("command", "")):
+                    cache.invalidate("run_shell")
 
         return result
 
-    # 替换 _run，保留其他所有属性
     tool_obj._run = cached_run
     return tool_obj
