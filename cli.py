@@ -99,9 +99,8 @@ def _bootstrap():
         _kb = kb
 
         # 内置工具
-        from tools.builtin_tools import BUILTIN_TOOLS, set_workspace
-        set_workspace(config.workspace_dir)
-        all_tools = list(BUILTIN_TOOLS)
+        from tools.plugin_loader import load_builtin_tools
+        all_tools = load_builtin_tools(config.workspace_dir)
 
         # 插件工具（自动发现）
         from tools.plugin_loader import discover_plugins
@@ -996,8 +995,15 @@ def _handle_slash(cmd: str, session_id: str, tools: list) -> str:
         _handle_task_cmd(parts)
 
     elif name == "/tools":
-        lines = [f"  [cyan]{t.name}[/]: {(t.description or '')[:80]}" for t in tools]
-        console.print(Panel("\n".join(lines), title=f"可用工具 ({len(tools)})"))
+        table = Table(title=f"可用工具 ({len(tools)})", border_style="cyan")
+        table.add_column("工具名", style="bold cyan")
+        table.add_column("来源", style="dim")
+        table.add_column("描述")
+        for t in tools:
+            source = getattr(t, "_source", "-")
+            desc = (t.description or "").split("\n")[0][:60]
+            table.add_row(t.name, source, desc)
+        console.print(table)
 
     elif name == "/clear":
         new_sid = _session_new()
@@ -1151,8 +1157,16 @@ def ingest(path: str):
 def tools():
     """列出所有可用工具"""
     all_tools = _bootstrap()
+    from rich.table import Table as RichTable
+    table = RichTable(title="可用工具", border_style="cyan")
+    table.add_column("工具名", style="bold cyan")
+    table.add_column("来源", style="dim")
+    table.add_column("描述")
     for t in all_tools:
-        console.print(f"[bold cyan]{t.name}[/]: {t.description or '（无描述）'}")
+        source = getattr(t, "_source", "-")
+        desc = (t.description or "").split("\n")[0][:60]
+        table.add_row(t.name, source, desc)
+    console.print(table)
 
 
 @cli.command("provider")

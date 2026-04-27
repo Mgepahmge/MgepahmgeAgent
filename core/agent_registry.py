@@ -267,12 +267,13 @@ class AgentRegistry:
                 raise ValueError("没有激活的 LLM Provider")
 
         # 过滤工具：base_tools 为空则使用全部
+        # 支持工具名、插件名（source）、mcp:server 三种引用方式
+        from core.skill_loader import resolve_tool_refs
         if profile.base_tools:
-            tool_name_set = set(profile.base_tools)
-            filtered_tools = [t for t in all_tools if t.name in tool_name_set]
-            missing = tool_name_set - {t.name for t in filtered_tools}
-            if missing:
-                logger.warning(f"Agent '{aid}' 指定的工具不存在: {missing}")
+            filtered_tools = resolve_tool_refs(profile.base_tools, all_tools)
+            if not filtered_tools:
+                logger.warning(f"Agent '{aid}' 的 base_tools 未匹配任何工具，回退到全部工具")
+                filtered_tools = list(all_tools)
         else:
             filtered_tools = list(all_tools)
 
