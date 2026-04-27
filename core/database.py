@@ -30,6 +30,7 @@ def init_db():
         CREATE TABLE IF NOT EXISTS sessions (
             id          TEXT PRIMARY KEY,
             name        TEXT NOT NULL DEFAULT '',
+            agent_id    TEXT NOT NULL DEFAULT 'default',
             created_at  REAL NOT NULL,
             updated_at  REAL NOT NULL,
             summary     TEXT NOT NULL DEFAULT ''
@@ -84,29 +85,36 @@ def init_db():
             updated_at  REAL NOT NULL
         );
         """)
+    # 迁移：为旧数据库的 sessions 表添加 agent_id 列（幂等）
+    try:
+        with get_conn() as conn:
+            conn.execute("ALTER TABLE sessions ADD COLUMN agent_id TEXT NOT NULL DEFAULT 'default'")
+    except Exception:
+        pass  # 列已存在，忽略
 
 
 # ──────────────────────────────────────────
 # 会话管理
 # ──────────────────────────────────────────
 
-def create_session(name: str = "") -> str:
+def create_session(name: str = "", agent_id: str = "default") -> str:
     sid = str(uuid.uuid4())
     now = time.time()
     with get_conn() as conn:
         conn.execute(
-            "INSERT INTO sessions (id, name, created_at, updated_at) VALUES (?,?,?,?)",
-            (sid, name or f"对话 {time.strftime('%m-%d %H:%M')}", now, now)
+            "INSERT INTO sessions (id, name, agent_id, created_at, updated_at) "
+            "VALUES (?,?,?,?,?)",
+            (sid, name or f"对话 {time.strftime('%m-%d %H:%M')}", agent_id, now, now)
         )
     return sid
 
 
-def list_sessions(limit: int = 20) -> list[dict]:
+def list_sessions(limit: int = 20, agent_id: str = "default") -> list[dict]:
     with get_conn() as conn:
         rows = conn.execute(
-            "SELECT id, name, created_at, updated_at, summary "
-            "FROM sessions ORDER BY updated_at DESC LIMIT ?",
-            (limit,)
+            "SELECT id, name, agent_id, created_at, updated_at, summary "
+            "FROM sessions WHERE agent_id=? ORDER BY updated_at DESC LIMIT ?",
+            (agent_id, limit)
         ).fetchall()
     return [dict(r) for r in rows]
 

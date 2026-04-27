@@ -212,7 +212,7 @@ def _run_query(query: str, thread_id: str) -> str:
 def _session_list() -> list:
     """列出对话，返回 sessions 列表供索引使用"""
     from core.database import list_sessions
-    sessions = list_sessions()
+    sessions = list_sessions(agent_id=_current_agent_id)
     if not sessions:
         console.print("[dim]暂无对话记录[/]")
         return []
@@ -231,7 +231,7 @@ def _session_list() -> list:
 
 def _session_new(name: str = "") -> str:
     from core.database import create_session
-    sid = create_session(name)
+    sid = create_session(name, agent_id=_current_agent_id)
     console.print(f"[green]✓ 新建对话 {sid[:8]}[/]")
     return sid
 
@@ -258,7 +258,7 @@ def _show_session_history(sid: str):
 def _session_load(identifier: str) -> str | None:
     """支持序号（数字）或 ID 前缀两种方式"""
     from core.database import list_sessions
-    sessions = list_sessions(100)
+    sessions = list_sessions(100, agent_id=_current_agent_id)
     target = None
     if identifier.isdigit():
         idx = int(identifier) - 1
@@ -284,7 +284,7 @@ def _session_load(identifier: str) -> str | None:
 def _session_delete(identifier: str):
     """支持序号（数字）或 ID 前缀两种方式，和 _session_load 逻辑一致"""
     from core.database import list_sessions, delete_session
-    sessions = list_sessions(100)
+    sessions = list_sessions(100, agent_id=_current_agent_id)
     target = None
     if identifier.isdigit():
         idx = int(identifier) - 1
@@ -1005,9 +1005,11 @@ def _handle_slash(cmd: str, session_id: str, tools: list) -> str:
         return new_sid
 
     elif name == "/agent":
+        old_aid = _current_agent_id
         new_aid = _handle_agent_cmd(parts)
-        if new_aid and new_aid != _current_agent_id:
-            _agent_switch(new_aid)
+        # 如果 Agent 切换了，返回 None 信号让 chat 重置 session_id
+        if _current_agent_id != old_aid:
+            return None
 
     elif name == "/skill":
         _handle_skill_cmd(parts)
@@ -1106,18 +1108,20 @@ def chat():
             continue
 
         if user_input.startswith("/"):
-            # /session 指令需要 session_id，若还未创建则传空字符串
             new_sid = _handle_slash(user_input, session_id or "", tools)
-            # 如果指令切换/新建了 session，更新 session_id
-            if new_sid and new_sid != (session_id or ""):
+            if new_sid is None:
+                # Agent 切换信号：重置 session_id
+                session_id = None
+                console.print(f"[dim]已切换到 Agent [{_current_agent_id}]，开启新对话[/]")
+            elif new_sid and new_sid != (session_id or ""):
                 session_id = new_sid
                 console.print(f"[dim]当前对话: [bold]{session_id[:8]}[/][/]")
             continue
 
-        # 首次发消息时创建 session
+        # 首次发消息时创建 session（绑定当前 Agent）
         if session_id is None:
             from core.database import create_session
-            session_id = create_session()
+            session_id = create_session(agent_id=_current_agent_id)
 
         with console.status("[bold cyan]思考中...", spinner="dots"):
             try:
