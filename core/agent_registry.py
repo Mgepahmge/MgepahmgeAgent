@@ -128,6 +128,7 @@ class AgentRuntime:
     _loop: asyncio.AbstractEventLoop = field(default=None, repr=False)
     _thread: threading.Thread = field(default=None, repr=False)
     _restored_sessions: set = field(default_factory=set, repr=False)
+    _cache: object = field(default=None, repr=False)  # ToolCache 实例
 
     def __post_init__(self):
         # 每个 Agent 独立的持久化事件循环
@@ -138,6 +139,10 @@ class AgentRuntime:
             daemon=True,
         )
         self._thread.start()
+        # 每个 Agent 独立的工具缓存
+        from core.tool_cache import ToolCache, wrap_tools_with_cache
+        self._cache = ToolCache()
+        self.tools = wrap_tools_with_cache(self.tools, self._cache)
 
     def _run_loop(self):
         asyncio.set_event_loop(self._loop)

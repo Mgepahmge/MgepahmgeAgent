@@ -854,6 +854,44 @@ def _handle_skill_cmd(parts: list[str]):
         ))
 
 
+# ──────────────────────────────────────────
+# /cache 指令
+# ──────────────────────────────────────────
+
+def _handle_cache_cmd(parts: list[str]):
+    """查看或管理工具调用缓存"""
+    from core.agent_registry import agent_registry
+    sub = parts[1] if len(parts) > 1 else "status"
+    runtime = agent_registry.get_runtime(_current_agent_id)
+
+    if sub == "status":
+        if runtime is None or runtime._cache is None:
+            console.print("[dim]当前 Agent 无缓存实例[/]")
+            return
+        stats = runtime._cache.stats()
+        table = Table(title=f"工具缓存状态（Agent: {_current_agent_id}）",
+                      border_style="cyan")
+        table.add_column("指标")
+        table.add_column("值", style="bold")
+        for k, v in stats.items():
+            table.add_row(k, str(v))
+        console.print(table)
+
+    elif sub == "clear":
+        if runtime is None or runtime._cache is None:
+            console.print("[dim]当前 Agent 无缓存实例[/]")
+            return
+        runtime._cache.invalidate()
+        console.print("[green]✓ 缓存已清空[/]")
+
+    else:
+        console.print(Panel(
+            "/cache status    查看缓存命中统计\n"
+            "/cache clear     清空当前 Agent 的全部缓存",
+            title="cache 指令",
+        ))
+
+
 def _handle_rag_cmd(parts: list[str]):
     """RAG 知识库管理"""
     sub = parts[1] if len(parts) > 1 else "status"
@@ -975,6 +1013,7 @@ def _handle_slash(cmd: str, session_id: str, tools: list) -> str:
             "/tools                        列出所有工具\n"
             "/agent [list/switch/start/stop/show] 管理 Agent\n"
             "/skill [list/enable/disable/show]   管理 Skill\n"
+            "/cache [status/clear]              工具调用缓存\n"
             "/rag [status/list/new/show/delete]  管理 RAG 知识集合\n"
             "/ingest <路径> [集合ID]        导入文档到知识库\n"
             "/clear                        清空当前对话记忆（新建会话）\n"
@@ -1019,6 +1058,9 @@ def _handle_slash(cmd: str, session_id: str, tools: list) -> str:
 
     elif name == "/skill":
         _handle_skill_cmd(parts)
+
+    elif name == "/cache":
+        _handle_cache_cmd(parts)
 
     elif name == "/rag":
         _handle_rag_cmd(parts)
@@ -1090,6 +1132,7 @@ def chat():
         "/agent", "/agent list", "/agent switch", "/agent start", "/agent stop",
         "/agent show", "/agent reload",
         "/skill", "/skill list", "/skill enable", "/skill disable", "/skill show", "/skill reload",
+        "/cache", "/cache status", "/cache clear",
         "/rag", "/rag status", "/rag list", "/rag new", "/rag show", "/rag delete",
     ]
     _completer = WordCompleter(_slash_commands, match_middle=False, sentence=True)
