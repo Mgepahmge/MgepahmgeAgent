@@ -139,10 +139,7 @@ class AgentRuntime:
             daemon=True,
         )
         self._thread.start()
-        # 每个 Agent 独立的工具缓存
-        from core.tool_cache import ToolCache, wrap_tools_with_cache
-        self._cache = ToolCache()
-        self.tools = wrap_tools_with_cache(self.tools, self._cache)
+        # _cache 由 start() 在构建图时创建并传入，此处不重建
 
     def _run_loop(self):
         asyncio.set_event_loop(self._loop)
@@ -304,8 +301,8 @@ class AgentRegistry:
         # 构建 LangGraph
         from core.agent_graph import build_llm, make_retrieve_node, make_llm_node
         from core.agent_graph import AgentState, should_continue, SYSTEM_PROMPT
+        from core.tool_cache import make_cached_tool_node
         from langgraph.graph import StateGraph, END
-        from langgraph.prebuilt import ToolNode
         from langgraph.checkpoint.memory import InMemorySaver
         from core.database import init_db
         init_db()
@@ -320,13 +317,12 @@ class AgentRegistry:
                 from langchain_core.messages import SystemMessage
                 rag_ctx = state.get("rag_context", "")
 
-                # 根据记忆配置决定注入哪些记忆
                 if use_global_mem and use_private_mem:
                     mem_agent_id = agent_id
                 elif use_global_mem:
-                    mem_agent_id = ""   # 只加载全局
+                    mem_agent_id = ""
                 elif use_private_mem:
-                    mem_agent_id = agent_id  # 只加载私有（通过过滤实现）
+                    mem_agent_id = agent_id
                 else:
                     mem_agent_id = None
 
@@ -356,7 +352,10 @@ class AgentRegistry:
             agent_system_prompt, full_skill_prompt,
             profile.memory.use_global, profile.memory.use_private,
         )
-        tool_node = ToolNode(merged_tools)
+        # 创建此 Agent 专属的工具缓存，构建带缓存的 ToolNode
+        from core.tool_cache import ToolCache
+        agent_cache = ToolCache()
+        tool_node = make_cached_tool_node(merged_tools, agent_cache)
 
         graph = StateGraph(AgentState)
         graph.add_node("retrieve", retrieve_node)
@@ -374,6 +373,7 @@ class AgentRegistry:
             llm=llm,
             tools=merged_tools,
             knowledge_ids=knowledge_ids,
+            _cache=agent_cache,
         )
         self._runtimes[aid] = runtime
         logger.info(

@@ -1,11 +1,9 @@
 """
 tool_cache.py - 工具调用结果缓存
 
-设计原则：
-  - 缓存范围：单个 AgentRuntime 实例内（不跨 session，不跨 Agent）
-  - 缓存 key：(工具名, 参数的规范化哈希)
-  - 每种工具独立的 TTL 和缓存策略
-  - 写操作不缓存，且会使相关缓存失效
+实现方式：
+  不修改工具对象本身，而是包装 LangGraph 的 ToolNode，
+  在节点层面拦截工具调用消息，查缓存/写缓存后再决定是否真正执行。
 
 缓存策略：
   工具             策略       TTL
@@ -21,11 +19,10 @@ import json
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import Any, Callable
 
 logger = logging.getLogger(__name__)
 
-# 默认 TTL 配置（秒）
+# 各工具默认 TTL（秒），不在此表中的工具不缓存
 _DEFAULT_TTL: dict[str, int] = {
     "web_search": 600,
     "fetch_url":  300,
@@ -39,21 +36,19 @@ _SHELL_WRITE_PREFIXES = {
     "systemctl", "service", "kill", "pkill",
     "tee", "truncate", "dd",
     "git commit", "git push", "git reset", "git rm",
-    "psql", "mysql",       # SQL 写操作（粗粒度判断）
+    "psql", "mysql",
 }
 
 
 def _is_shell_readonly(command: str) -> bool:
-    """判断 shell 命令是否为只读操作（保守策略：不确定时返回 False）"""
+    """判断 shell 命令是否为只读操作（保守策略）"""
     cmd = command.strip().lower()
     first_token = cmd.split()[0].split("/")[-1] if cmd.split() else ""
     if first_token in _SHELL_WRITE_PREFIXES:
         return False
-    # 包含重定向写入符号
     if any(op in command for op in [" > ", " >> ", "| tee", "| dd"]):
         return False
-    # 包含写操作关键词
-    if any(kw in cmd for kw in ["write", "insert", "update", "delete", "drop", "create table"]):
+    if any(kw in cmd for kw in ["insert ", "update ", "delete ", "drop ", "create table"]):
         return False
     return True
 
@@ -70,7 +65,6 @@ class _CacheEntry:
 class ToolCache:
     """
     工具调用缓存，绑定到单个 AgentRuntime 实例。
-    非线程安全（每个 AgentRuntime 有独立实例，各自在自己的事件循环里调用）。
     """
 
     def __init__(self):
@@ -78,65 +72,51 @@ class ToolCache:
         self._hits: int = 0
         self._misses: int = 0
 
-    # ──────────────────────────────────────────
-    # 公开接口
-    # ──────────────────────────────────────────
+    def should_cache(self, tool_name: str, tool_args: dict) -> bool:
+        if tool_name not in _DEFAULT_TTL:
+            return False
+        if tool_name == "run_shell":
+            return _is_shell_readonly(tool_args.get("command", ""))
+        return True
 
-    def get(self, tool_name: str, kwargs: dict) -> str | None:
-        """查询缓存，命中返回结果字符串，未命中返回 None"""
-        key = self._make_key(tool_name, kwargs)
+    def get(self, tool_name: str, tool_args: dict) -> str | None:
+        key = self._make_key(tool_name, tool_args)
         entry = self._store.get(key)
         if entry and entry.is_valid():
             self._hits += 1
-            logger.debug(f"缓存命中: {tool_name}({self._repr_kwargs(kwargs)})")
+            logger.debug(f"缓存命中: {tool_name}")
             return entry.value
         if entry:
-            del self._store[key]   # 清理过期条目
+            del self._store[key]
         self._misses += 1
         return None
 
-    def set(self, tool_name: str, kwargs: dict, value: str):
-        """写入缓存"""
+    def set(self, tool_name: str, tool_args: dict, value: str):
         ttl = _DEFAULT_TTL.get(tool_name, 0)
         if ttl <= 0:
             return
-        key = self._make_key(tool_name, kwargs)
+        key = self._make_key(tool_name, tool_args)
         self._store[key] = _CacheEntry(
             value=value,
             expires_at=time.monotonic() + ttl,
         )
-        logger.debug(f"缓存写入: {tool_name}({self._repr_kwargs(kwargs)}) TTL={ttl}s")
+        logger.debug(f"缓存写入: {tool_name} TTL={ttl}s")
 
-    def should_cache(self, tool_name: str, kwargs: dict) -> bool:
-        """判断此次调用是否应该缓存"""
-        if tool_name not in _DEFAULT_TTL:
-            return False
-        if tool_name == "run_shell":
-            command = kwargs.get("command", "")
-            return _is_shell_readonly(command)
-        return True
+    def invalidate_shell(self):
+        """写操作后清空 run_shell 的缓存"""
+        keys = [k for k in self._store if k.startswith("run_shell:")]
+        for k in keys:
+            del self._store[k]
 
-    def invalidate(self, pattern: str | None = None):
-        """
-        使缓存失效。
-        pattern=None  : 清空全部
-        pattern='run_shell' : 清空指定工具的缓存
-        """
-        if pattern is None:
-            count = len(self._store)
-            self._store.clear()
-            logger.debug(f"缓存清空: {count} 条")
-        else:
-            keys = [k for k in self._store if k.startswith(f"{pattern}:")]
-            for k in keys:
-                del self._store[k]
-            logger.debug(f"缓存失效: {pattern} {len(keys)} 条")
+    def invalidate_all(self):
+        count = len(self._store)
+        self._store.clear()
+        logger.debug(f"缓存全部清空: {count} 条")
 
     def stats(self) -> dict:
-        """返回缓存统计信息"""
         valid = sum(1 for e in self._store.values() if e.is_valid())
         total = self._hits + self._misses
-        hit_rate = f"{self._hits/total*100:.1f}%" if total > 0 else "N/A"
+        hit_rate = f"{self._hits / total * 100:.1f}%" if total > 0 else "N/A"
         return {
             "有效条目": valid,
             "总条目": len(self._store),
@@ -145,98 +125,88 @@ class ToolCache:
             "命中率": hit_rate,
         }
 
-    # ──────────────────────────────────────────
-    # 内部方法
-    # ──────────────────────────────────────────
-
     @staticmethod
-    def _make_key(tool_name: str, kwargs: dict) -> str:
-        """生成稳定的缓存 key"""
-        canonical = json.dumps(kwargs, sort_keys=True, ensure_ascii=False, default=str)
+    def _make_key(tool_name: str, tool_args: dict) -> str:
+        canonical = json.dumps(tool_args, sort_keys=True,
+                               ensure_ascii=False, default=str)
         digest = hashlib.md5(canonical.encode()).hexdigest()[:12]
         return f"{tool_name}:{digest}"
 
-    @staticmethod
-    def _repr_kwargs(kwargs: dict) -> str:
-        """简短展示参数（用于日志）"""
-        s = json.dumps(kwargs, ensure_ascii=False, default=str)
-        return s[:60] + "..." if len(s) > 60 else s
 
+# ──────────────────────────────────────────
+# 缓存化 ToolNode
+# ──────────────────────────────────────────
 
-def wrap_tools_with_cache(tools: list, cache: ToolCache) -> list:
+def make_cached_tool_node(tools: list, cache: ToolCache):
     """
-    用缓存包装器包装工具列表。
-    通过继承 StructuredTool 创建新对象，不修改原始工具，
-    避免 LangChain 内部参数传递问题。
+    返回一个带缓存的 ToolNode 替代品。
+    在 LangGraph 节点层面拦截工具调用消息，
+    命中缓存时直接构造 ToolMessage 返回，跳过真正的工具执行。
+    未命中时执行原始工具并写入缓存。
     """
-    wrapped = []
-    for t in tools:
-        if t.name in _DEFAULT_TTL:
-            wrapped.append(_wrap_one(t, cache))
+    from langgraph.prebuilt import ToolNode
+    from langchain_core.messages import ToolMessage, AIMessage
+
+    tool_map = {t.name: t for t in tools}
+    original_node = ToolNode(tools)
+
+    async def cached_node(state: dict) -> dict:
+        messages = state.get("messages", [])
+        last = messages[-1] if messages else None
+
+        # 只处理有 tool_calls 的 AIMessage
+        if not isinstance(last, AIMessage) or not last.tool_calls:
+            return await original_node.ainvoke(state)
+
+        cached_results: list[ToolMessage] = []
+        uncached_calls: list = []
+
+        for call in last.tool_calls:
+            tool_name = call.get("name", "")
+            tool_args = call.get("args", {})
+            call_id = call.get("id", "")
+
+            if cache.should_cache(tool_name, tool_args):
+                hit = cache.get(tool_name, tool_args)
+                if hit is not None:
+                    cached_results.append(
+                        ToolMessage(content=hit, tool_call_id=call_id)
+                    )
+                    continue
+            uncached_calls.append(call)
+
+        # 全部命中缓存：直接返回
+        if not uncached_calls:
+            return {"messages": cached_results}
+
+        # 部分或全部未命中：执行原始节点
+        # 构造只含未命中调用的临时状态
+        if len(uncached_calls) < len(last.tool_calls):
+            import copy
+            temp_last = copy.copy(last)
+            object.__setattr__(temp_last, "tool_calls", uncached_calls)
+            temp_state = {**state, "messages": messages[:-1] + [temp_last]}
         else:
-            wrapped.append(t)
-    return wrapped
+            temp_state = state
 
+        result = await original_node.ainvoke(temp_state)
+        new_messages = result.get("messages", [])
 
-def _wrap_one(tool_obj, cache: ToolCache):
-    """
-    通过重写 invoke/ainvoke 包装缓存逻辑。
-    在 LangChain 的公开 API 层面拦截，避免触碰内部 _run 签名问题。
-    """
-    from langchain_core.tools import StructuredTool
-    from langchain_core.callbacks import CallbackManagerForToolRun
-    from typing import Any
+        # 将未命中的结果写入缓存
+        call_map = {c.get("id", ""): c for c in uncached_calls}
+        for msg in new_messages:
+            if isinstance(msg, ToolMessage):
+                call = call_map.get(msg.tool_call_id, {})
+                tool_name = call.get("name", "")
+                tool_args = call.get("args", {})
+                if cache.should_cache(tool_name, tool_args):
+                    cache.set(tool_name, tool_args, msg.content)
+                    # 写操作后清空 shell 缓存
+                    if tool_name == "run_shell":
+                        if not _is_shell_readonly(tool_args.get("command", "")):
+                            cache.invalidate_shell()
 
-    original_invoke = tool_obj.invoke
-    original_ainvoke = tool_obj.ainvoke
+        # 合并缓存命中 + 真实执行的结果
+        return {"messages": cached_results + new_messages}
 
-    def _extract_business_args(tool_input) -> dict:
-        """从工具输入中提取业务参数（用于缓存 key）"""
-        if isinstance(tool_input, dict):
-            return tool_input
-        elif isinstance(tool_input, str):
-            return {"input": tool_input}
-        return {}
-
-    def cached_invoke(input: Any, config=None, **kwargs) -> str:
-        business_args = _extract_business_args(input)
-
-        if cache.should_cache(tool_obj.name, business_args):
-            hit = cache.get(tool_obj.name, business_args)
-            if hit is not None:
-                return hit
-
-        result = original_invoke(input, config=config, **kwargs)
-
-        if cache.should_cache(tool_obj.name, business_args):
-            cache.set(tool_obj.name, business_args, result)
-            if tool_obj.name == "run_shell":
-                cmd = business_args.get("command", "")
-                if not _is_shell_readonly(cmd):
-                    cache.invalidate("run_shell")
-
-        return result
-
-    async def cached_ainvoke(input: Any, config=None, **kwargs) -> str:
-        business_args = _extract_business_args(input)
-
-        if cache.should_cache(tool_obj.name, business_args):
-            hit = cache.get(tool_obj.name, business_args)
-            if hit is not None:
-                return hit
-
-        result = await original_ainvoke(input, config=config, **kwargs)
-
-        if cache.should_cache(tool_obj.name, business_args):
-            cache.set(tool_obj.name, business_args, result)
-            if tool_obj.name == "run_shell":
-                cmd = business_args.get("command", "")
-                if not _is_shell_readonly(cmd):
-                    cache.invalidate("run_shell")
-
-        return result
-
-    # 在公开 API 层面替换，不触碰内部 _run
-    tool_obj.invoke = cached_invoke
-    tool_obj.ainvoke = cached_ainvoke
-    return tool_obj
+    return cached_node
