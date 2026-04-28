@@ -146,21 +146,87 @@ class AgentRuntime:
         self._loop.run_forever()
 
     def invoke(self, query: str, session_id: str) -> str:
-        """同步调用 Agent，阻塞直到返回结果"""
-        from langchain_core.messages import HumanMessage
+        """同步调用 Agent，阻塞直到返回结果（非流式）"""
         future = asyncio.run_coroutine_threadsafe(
             self._ainvoke(query, session_id), self._loop
         )
         return future.result()
 
-    async def _ainvoke(self, query: str, session_id: str) -> str:
-        from langchain_core.messages import HumanMessage, AIMessage
-        from core.database import load_messages
+    def stream(self, query: str, session_id: str):
+        """
+        流式调用 Agent，返回一个同步生成器。
+        每次 yield 一个字符串片段，调用方实时打印即可。
 
-        # 首次使用该 session 时从数据库恢复历史上下文
+        特殊 yield 格式：
+          普通文本 token  → 直接字符串
+          工具调用开始    → "\x00TOOL_START:<工具名>"
+          工具调用结束    → "\x00TOOL_END:<工具名>"
+        """
+        import queue
+        import threading
+
+        q: queue.Queue = queue.Queue()
+        _SENTINEL = object()
+
+        async def _astream():
+            try:
+                await self._ensure_context(query, session_id)
+                from langchain_core.messages import HumanMessage
+                config = {"configurable": {"thread_id": session_id}}
+                input_state = {
+                    "messages": [HumanMessage(content=query)],
+                    "workspace": self.profile.workdir or "",
+                }
+                async for event in self.graph.astream_events(
+                    input_state, config=config, version="v2"
+                ):
+                    kind = event.get("event", "")
+                    name = event.get("name", "")
+
+                    # LLM token
+                    if kind == "on_chat_model_stream":
+                        chunk = event.get("data", {}).get("chunk")
+                        if chunk and hasattr(chunk, "content"):
+                            text = chunk.content
+                            if isinstance(text, str) and text:
+                                q.put(text)
+                            elif isinstance(text, list):
+                                for block in text:
+                                    if isinstance(block, dict) and block.get("type") == "text":
+                                        t = block.get("text", "")
+                                        if t:
+                                            q.put(t)
+
+                    # 工具调用开始
+                    elif kind == "on_tool_start":
+                        q.put(f"\x00TOOL_START:{name}")
+
+                    # 工具调用结束
+                    elif kind == "on_tool_end":
+                        q.put(f"\x00TOOL_END:{name}")
+
+            except Exception as e:
+                q.put(f"\x00ERROR:{e}")
+            finally:
+                q.put(_SENTINEL)
+
+        # 在 Agent 事件循环里运行，不阻塞当前线程
+        asyncio.run_coroutine_threadsafe(_astream(), self._loop)
+
+        # 同步生成器：从队列里取结果逐个 yield
+        while True:
+            item = q.get()
+            if item is _SENTINEL:
+                break
+            yield item
+
+    async def _ensure_context(self, query: str, session_id: str):
+        """首次使用 session 时从数据库恢复历史上下文（stream 专用）"""
         if session_id not in self._restored_sessions:
+            from langchain_core.messages import HumanMessage, AIMessage
+            from core.database import load_messages, save_message
             history = load_messages(session_id)
-            prior = history[:-1]  # 不含刚存入的当前消息
+            prior = history[:-1]
             if prior:
                 prior_msgs = []
                 for m in prior:
@@ -176,6 +242,9 @@ class AgentRuntime:
                     )
             self._restored_sessions.add(session_id)
 
+    async def _ainvoke(self, query: str, session_id: str) -> str:
+        from langchain_core.messages import HumanMessage
+        await self._ensure_context(query, session_id)
         result = await self.graph.ainvoke(
             {"messages": [HumanMessage(content=query)],
              "workspace": self.profile.workdir or ""},

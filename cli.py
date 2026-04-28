@@ -152,18 +152,66 @@ def _rebuild_agent():
 
 
 def _run_query(query: str, thread_id: str) -> str:
+    """
+    流式调用 Agent，实时打印 token。
+    工具调用期间显示状态提示。
+    返回完整回复字符串（供后续保存）。
+    """
     from core.database import save_message
     from core.agent_registry import agent_registry
 
-    # 保存用户消息
     save_message(thread_id, "human", query)
 
-    # 通过当前 Agent 的 Runtime 调用（每个 Agent 有独立事件循环）
     runtime = agent_registry.get_runtime(_current_agent_id)
     if runtime is None:
         return "当前 Agent 未启动，请检查配置"
 
-    answer = runtime.invoke(query, thread_id)
+    # 打印 Agent 标头
+    console.print("\n[bold green]Agent[/] ", end="")
+
+    full_answer: list[str] = []
+    current_tool: str = ""
+    tool_status_line: bool = False  # 是否已打印过工具状态行
+
+    try:
+        for chunk in runtime.stream(query, thread_id):
+            if chunk.startswith("\x00TOOL_START:"):
+                tool_name = chunk[len("\x00TOOL_START:"):]
+                current_tool = tool_name
+                # 换行后显示工具调用状态（dim 样式，不干扰正文）
+                console.print(f"\n[dim]  ⚙ 调用工具: {tool_name}...[/]", end="")
+                tool_status_line = True
+
+            elif chunk.startswith("\x00TOOL_END:"):
+                tool_name = chunk[len("\x00TOOL_END:"):]
+                # 工具结束后换行，准备打印后续 token
+                if tool_status_line:
+                    console.print()
+                    tool_status_line = False
+                current_tool = ""
+
+            elif chunk.startswith("\x00ERROR:"):
+                err = chunk[len("\x00ERROR:"):]
+                console.print(f"\n[red]执行出错: {err}[/]")
+                return f"执行出错: {err}"
+
+            else:
+                # 普通文本 token：直接打印，不换行
+                if tool_status_line:
+                    # 工具结束后还没换行，先补一个换行
+                    console.print()
+                    tool_status_line = False
+                print(chunk, end="", flush=True)
+                full_answer.append(chunk)
+
+    except Exception as e:
+        console.print(f"\n[red]流式输出异常: {e}[/]")
+        import traceback
+        traceback.print_exc()
+
+    # 结尾换行，保持终端整洁
+    print()
+    answer = "".join(full_answer)
 
     # 保存 AI 回复
     save_message(thread_id, "assistant", answer)
@@ -1102,10 +1150,8 @@ def cli(ctx, query):
         if query:
             _bootstrap()
             from core.database import create_session
-            sid = create_session()
-            with console.status("[bold cyan]思考中...", spinner="dots"):
-                answer = _run_query(query, sid)
-            console.print(Markdown(answer))
+            sid = create_session(agent_id=_current_agent_id)
+            answer = _run_query(query, sid)
         else:
             ctx.invoke(chat)
 
@@ -1172,15 +1218,12 @@ def chat():
             from core.database import create_session
             session_id = create_session(agent_id=_current_agent_id)
 
-        with console.status("[bold cyan]思考中...", spinner="dots"):
-            try:
-                answer = _run_query(user_input, session_id)
-            except Exception as e:
-                import traceback
-                answer = f"执行出错: {e}\n{traceback.format_exc()}"
-
-        console.print("\n[bold green]Agent[/]")
-        console.print(Markdown(answer))
+        try:
+            answer = _run_query(user_input, session_id)
+        except Exception as e:
+            import traceback
+            answer = f"执行出错: {e}\n{traceback.format_exc()}"
+            console.print(f"[red]{answer}[/]")
 
 
 @cli.command()
