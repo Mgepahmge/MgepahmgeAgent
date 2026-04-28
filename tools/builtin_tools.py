@@ -31,77 +31,6 @@ def _resolve_path(path: str) -> Path:
 
 
 # ──────────────────────────────────────────
-# Web 工具
-# ──────────────────────────────────────────
-
-@tool
-def web_search(query: str, max_results: int = 8) -> str:
-    """搜索互联网，返回标题 + 摘要 + URL。优先 Brave Search，回退 DuckDuckGo lite。"""
-    brave_key = os.getenv("BRAVE_API_KEY", "")
-    if brave_key:
-        try:
-            import requests as _req
-            resp = _req.get(
-                "https://api.search.brave.com/res/v1/web/search",
-                headers={"Accept": "application/json", "X-Subscription-Token": brave_key},
-                params={"q": query, "count": max_results},
-                timeout=15,
-            )
-            resp.raise_for_status()
-            items = resp.json().get("web", {}).get("results", [])
-            if items:
-                results = [
-                    f"### {r.get('title', '')}\n{r.get('description', '')}\nURL: {r.get('url', '')}"
-                    for r in items
-                ]
-                return "\n---\n".join(results)
-        except Exception as e:
-            logger.warning(f"Brave Search 失败，回退到 DuckDuckGo: {e}")
-
-    try:
-        from ddgs import DDGS
-    except ImportError:
-        from duckduckgo_search import DDGS
-
-    last_err = None
-    for backend in ["lite", "auto"]:
-        try:
-            results = []
-            with DDGS() as ddgs:
-                for r in ddgs.text(query, max_results=max_results, backend=backend):
-                    results.append(
-                        f"### {r.get('title', '')}\n"
-                        f"{r.get('body', '')}\n"
-                        f"URL: {r.get('href', '')}\n"
-                    )
-            if results:
-                return "\n---\n".join(results)
-        except Exception as e:
-            last_err = e
-            logger.warning(f"DuckDuckGo backend={backend} 失败: {e}")
-
-    return f"搜索失败（所有后端均不可用）: {last_err}"
-
-
-@tool
-def fetch_url(url: str, timeout: int = 15) -> str:
-    """抓取指定 URL 的网页正文（自动去除 HTML 标签）。"""
-    try:
-        import requests
-        from bs4 import BeautifulSoup
-        headers = {"User-Agent": "Mozilla/5.0 (compatible; AgentBot/1.0)"}
-        resp = requests.get(url, headers=headers, timeout=timeout)
-        resp.raise_for_status()
-        soup = BeautifulSoup(resp.text, "html.parser")
-        for tag in soup(["script", "style", "nav", "footer", "header"]):
-            tag.decompose()
-        text = soup.get_text(separator="\n", strip=True)
-        return text[:12000] + ("\n... [截断]" if len(text) > 12000 else "")
-    except Exception as e:
-        return f"ERROR: {e}"
-
-
-# ──────────────────────────────────────────
 # Shell 工具
 # ──────────────────────────────────────────
 
@@ -134,7 +63,5 @@ def run_shell(command: str, workdir: Optional[str] = None, timeout: int = 60) ->
 
 # 导出内置工具（文件系统由 MCP filesystem server 负责）
 BUILTIN_TOOLS = [
-    web_search,
-    fetch_url,
     run_shell,
 ]
