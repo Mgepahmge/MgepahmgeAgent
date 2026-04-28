@@ -151,10 +151,15 @@ def _rebuild_agent():
     _agent, _llm = build_agent(_cfg, _kb, _all_tools)
 
 
+def _sanitize(text: str) -> str:
+    """移除无法被 UTF-8 编码的代理字符（surrogate characters）"""
+    return text.encode("utf-8", errors="replace").decode("utf-8")
+
+
 def _run_query(query: str, thread_id: str) -> str:
     """
     流式调用 Agent，实时打印 token。
-    工具调用期间显示状态提示。
+    工具调用期间显示 spinner 提示。
     返回完整回复字符串（供后续保存）。
     """
     from core.database import save_message
@@ -166,51 +171,80 @@ def _run_query(query: str, thread_id: str) -> str:
     if runtime is None:
         return "当前 Agent 未启动，请检查配置"
 
-    # 打印 Agent 标头
-    console.print("\n[bold green]Agent[/] ", end="")
-
     full_answer: list[str] = []
-    current_tool: str = ""
-    tool_status_line: bool = False  # 是否已打印过工具状态行
+    first_token_received = False
+    in_tool_call = False
+    _live_status = None  # rich Live spinner 实例
+
+    def _start_spinner(msg: str):
+        """启动思考中 spinner"""
+        nonlocal _live_status
+        from rich.spinner import Spinner
+        from rich.live import Live
+        _live_status = Live(
+            Spinner("dots", text=f"[cyan]{msg}[/]"),
+            console=console,
+            refresh_per_second=10,
+            transient=True,   # 结束后自动清除，不留残影
+        )
+        _live_status.__enter__()
+
+    def _stop_spinner():
+        """停止 spinner"""
+        nonlocal _live_status
+        if _live_status is not None:
+            try:
+                _live_status.__exit__(None, None, None)
+            except Exception:
+                pass
+            _live_status = None
+
+    # 启动初始 spinner，等待第一个 token
+    _start_spinner("思考中...")
+    console.print("\n[bold green]Agent[/]")
 
     try:
         for chunk in runtime.stream(query, thread_id):
+
             if chunk.startswith("\x00TOOL_START:"):
                 tool_name = chunk[len("\x00TOOL_START:"):]
-                current_tool = tool_name
-                # 换行后显示工具调用状态（dim 样式，不干扰正文）
-                console.print(f"\n[dim]  ⚙ 调用工具: {tool_name}...[/]", end="")
-                tool_status_line = True
+                _stop_spinner()
+                # 工具调用：启动新 spinner 提示
+                _start_spinner(f"调用工具: {tool_name}...")
+                in_tool_call = True
 
             elif chunk.startswith("\x00TOOL_END:"):
-                tool_name = chunk[len("\x00TOOL_END:"):]
-                # 工具结束后换行，准备打印后续 token
-                if tool_status_line:
-                    console.print()
-                    tool_status_line = False
-                current_tool = ""
+                _stop_spinner()
+                in_tool_call = False
+                # 工具结束后重新等待下一个 token
+                _start_spinner("思考中...")
 
             elif chunk.startswith("\x00ERROR:"):
+                _stop_spinner()
                 err = chunk[len("\x00ERROR:"):]
-                console.print(f"\n[red]执行出错: {err}[/]")
+                console.print(f"[red]执行出错: {err}[/]")
                 return f"执行出错: {err}"
 
             else:
-                # 普通文本 token：直接打印，不换行
-                if tool_status_line:
-                    # 工具结束后还没换行，先补一个换行
-                    console.print()
-                    tool_status_line = False
-                print(chunk, end="", flush=True)
-                full_answer.append(chunk)
+                # 收到第一个 token，停止 spinner，开始打印正文
+                if not first_token_received:
+                    _stop_spinner()
+                    first_token_received = True
+
+                clean = _sanitize(chunk)
+                print(clean, end="", flush=True)
+                full_answer.append(clean)
 
     except Exception as e:
-        console.print(f"\n[red]流式输出异常: {e}[/]")
+        _stop_spinner()
+        console.print(f"[red]流式输出异常: {e}[/]")
         import traceback
         traceback.print_exc()
+    finally:
+        _stop_spinner()
 
-    # 结尾换行，保持终端整洁
-    print()
+    # 确保输出以换行结束，保证 prompt_toolkit 输入框正常渲染
+    print("\n", end="", flush=True)
     answer = "".join(full_answer)
 
     # 保存 AI 回复

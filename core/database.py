@@ -154,11 +154,13 @@ def delete_session(sid: str):
 # ──────────────────────────────────────────
 
 def save_message(session_id: str, role: str, content: str, tool_calls=None):
+    # 清理无法 UTF-8 编码的代理字符（来自 MCP 工具输出等）
+    safe_content = content.encode("utf-8", errors="replace").decode("utf-8")
     with get_conn() as conn:
         conn.execute(
             "INSERT INTO messages (session_id, role, content, tool_calls, created_at) "
             "VALUES (?,?,?,?,?)",
-            (session_id, role, content,
+            (session_id, role, safe_content,
              json.dumps(tool_calls) if tool_calls else None,
              time.time())
         )
