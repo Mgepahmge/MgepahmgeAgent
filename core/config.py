@@ -209,6 +209,12 @@ class MCPConfig:
             raw = json.loads(path.read_text())
             for name, cfg in raw.get("servers", {}).items():
                 cfg["args"] = [_expand(a) for a in cfg.get("args", [])]
+                # env 字段：展开 ${VAR} 占位符，值和键都支持
+                if cfg.get("env"):
+                    cfg["env"] = {
+                        _expand(k): _expand(v)
+                        for k, v in cfg["env"].items()
+                    }
                 self.servers[name] = cfg
 
 
