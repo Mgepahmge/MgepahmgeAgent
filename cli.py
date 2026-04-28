@@ -122,6 +122,26 @@ def _bootstrap():
     # 启动完成：移除终端日志输出，后续日志静默写入文件
     logging.getLogger().removeHandler(_stderr_handler)
 
+    # 将 fd 2（stderr）重定向到日志文件
+    # 效果：所有子进程（MCP server 等）的 stderr 输出也写入日志，不污染终端
+    # sys.stderr 替换为包装了日志的写入器，捕获 Python 层的 print(..., file=sys.stderr)
+    import os
+    _log_fd = open(str(log_path), "a", buffering=1, encoding="utf-8", errors="replace")
+    os.dup2(_log_fd.fileno(), 2)   # fd 2 → log file（子进程继承）
+
+    class _StderrToLog:
+        """把 Python 层的 sys.stderr 写入重定向，转发到 logging"""
+        def write(self, msg: str):
+            msg = msg.rstrip("\n")
+            if msg.strip():
+                logging.getLogger("stderr").debug(msg)
+        def flush(self):
+            pass
+        def fileno(self):
+            return 2  # 返回已重定向的 fd 2
+
+    sys.stderr = _StderrToLog()
+
     profile = config.providers.active()
     from core.agent_registry import agent_registry
     runtime = agent_registry.get_runtime(_current_agent_id)
