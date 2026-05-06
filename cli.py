@@ -957,6 +957,77 @@ def _handle_skill_cmd(parts: list[str]):
 
 
 # ──────────────────────────────────────────
+# /project 指令
+# ──────────────────────────────────────────
+
+def _handle_project_cmd(parts: list[str]):
+    sub = parts[1] if len(parts) > 1 else "status"
+
+    if sub == "status":
+        from core.project_index import get_current_index
+        index = get_current_index()
+        if index is None:
+            console.print("[dim]当前没有激活的项目索引[/]")
+            console.print("[dim]使用 /project index <目录> 建立索引[/]")
+            return
+        status = index.status()
+        table = Table(title="项目索引状态", border_style="cyan")
+        table.add_column("项目")
+        table.add_column("值", style="bold")
+        for k, v in status.items():
+            table.add_row(k, str(v))
+        console.print(table)
+
+    elif sub == "index" and len(parts) >= 3:
+        path = " ".join(parts[2:])
+        from core.project_index import ProjectIndex, set_current_index
+        from pathlib import Path
+        root = Path(path).expanduser().resolve()
+        if not root.exists() or not root.is_dir():
+            console.print(f"[red]目录不存在: {path}[/]")
+            return
+        index = ProjectIndex(str(root))
+        needs, reason = index.needs_reindex()
+        if not needs:
+            set_current_index(index)
+            status = index.status()
+            console.print(f"[green]✓ 索引已是最新，直接使用[/]")
+            console.print(f"[dim]符号数: {status['符号数']}，文件数: {status['文件数']}[/]")
+            return
+        console.print(f"[cyan]建立索引: {root}（{reason}）[/]")
+        from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TaskProgressColumn(),
+            console=console,
+        ) as progress:
+            task = progress.add_task("解析代码...", total=None)
+            def _cb(cur, total, msg):
+                progress.update(task, completed=cur, total=total, description=msg[:50])
+            try:
+                meta = index.build(progress_cb=_cb)
+                set_current_index(index)
+                console.print(f"[green]✓ 索引完成：{meta.symbol_count} 个符号，{len(meta.file_hashes)} 个文件[/]")
+            except Exception as e:
+                console.print(f"[red]索引失败: {e}[/]")
+
+    elif sub == "clear":
+        from core.project_index import set_current_index
+        set_current_index(None)
+        console.print("[green]✓ 已清除当前项目索引[/]")
+
+    else:
+        console.print(Panel(
+            "/project status          查看当前索引状态\n"
+            "/project index <目录>    为目录建立/更新索引\n"
+            "/project clear           清除当前索引",
+            title="project 指令",
+        ))
+
+
+# ──────────────────────────────────────────
 # /cache 指令
 # ──────────────────────────────────────────
 
@@ -1115,6 +1186,7 @@ def _handle_slash(cmd: str, session_id: str, tools: list) -> str:
             "/tools                        列出所有工具\n"
             "/agent [list/switch/start/stop/show] 管理 Agent\n"
             "/skill [list/enable/disable/show]   管理 Skill\n"
+            "/project [status/index/clear]      项目代码索引\n"
             "/cache [status/clear]              工具调用缓存\n"
             "/rag [status/list/new/show/delete]  管理 RAG 知识集合\n"
             "/ingest <路径> [集合ID]        导入文档到知识库\n"
@@ -1160,6 +1232,9 @@ def _handle_slash(cmd: str, session_id: str, tools: list) -> str:
 
     elif name == "/skill":
         _handle_skill_cmd(parts)
+
+    elif name == "/project":
+        _handle_project_cmd(parts)
 
     elif name == "/cache":
         _handle_cache_cmd(parts)
@@ -1232,6 +1307,7 @@ def chat():
         "/agent", "/agent list", "/agent switch", "/agent start", "/agent stop",
         "/agent show", "/agent reload",
         "/skill", "/skill list", "/skill enable", "/skill disable", "/skill show", "/skill reload",
+        "/project", "/project status", "/project index", "/project clear",
         "/cache", "/cache status", "/cache clear",
         "/rag", "/rag status", "/rag list", "/rag new", "/rag show", "/rag delete",
     ]

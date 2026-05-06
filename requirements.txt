@@ -51,3 +51,10 @@ aiosqlite>=0.19.0>=2.0.0
 
 # Skill 配置解析
 pyyaml>=6.0.0
+
+# 项目感知（深度索引）
+chromadb>=0.5.0
+tree-sitter>=0.23.0
+tree-sitter-python>=0.23.0
+tree-sitter-cpp>=0.23.0
+tree-sitter-c>=0.23.0
